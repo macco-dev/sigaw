@@ -232,6 +232,16 @@ struct Config {
         return runtime_dir() / "sigaw-ctl.sock";
     }
 
+    static std::string shared_memory_name() {
+        const char* env_override = std::getenv("SIGAW_SHM_NAME");
+        if (env_override && *env_override) {
+            return env_override;
+        }
+
+        return "/sigaw-voice-" +
+               std::to_string(static_cast<unsigned long long>(::getuid()));
+    }
+
     bool save() const {
         return write_to_path(config_path());
     }

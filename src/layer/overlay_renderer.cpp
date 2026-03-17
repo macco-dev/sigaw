@@ -24,12 +24,13 @@
 #include "../common/protocol.h"
 
 extern "C" {
-int sigaw_overlay_init(VkDevice, VkPhysicalDevice, VkInstance, uint32_t,
-                       VkQueue, PFN_vkGetPhysicalDeviceMemoryProperties,
-                       VkFormat, uint32_t, uint32_t);
-void sigaw_overlay_shutdown(VkDevice);
-void sigaw_overlay_resize(VkDevice, VkFormat, uint32_t, uint32_t);
-int sigaw_overlay_render(VkDevice, VkQueue, VkImage, VkFormat,
+struct SigawOverlayContext;
+SigawOverlayContext* sigaw_overlay_create(VkDevice, VkPhysicalDevice, VkInstance, uint32_t,
+                                          VkQueue, PFN_vkGetPhysicalDeviceMemoryProperties,
+                                          VkFormat, uint32_t, uint32_t);
+void sigaw_overlay_destroy(SigawOverlayContext*);
+void sigaw_overlay_resize(SigawOverlayContext*, VkFormat, uint32_t, uint32_t);
+int sigaw_overlay_render(SigawOverlayContext*, VkQueue, VkImage, VkFormat,
                          uint32_t, uint32_t, uint32_t, const VkSemaphore*,
                          VkSemaphore, VkFence);
 }
@@ -846,8 +847,6 @@ struct Ctx {
     bool             ok = false;
 };
 
-static Ctx G;
-
 static bool supports_staging_copy_format(VkFormat fmt)
 {
     switch (fmt) {
@@ -863,13 +862,13 @@ static bool supports_staging_copy_format(VkFormat fmt)
     }
 }
 
-static uint32_t find_mem(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags f) {
-    if (!G.get_phys_props) {
+static uint32_t find_mem(Ctx& ctx, VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags f) {
+    if (!ctx.get_phys_props) {
         return UINT32_MAX;
     }
 
     VkPhysicalDeviceMemoryProperties mp;
-    G.get_phys_props(pd, &mp);
+    ctx.get_phys_props(pd, &mp);
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
         if ((bits & (1u<<i)) && (mp.memoryTypes[i].propertyFlags & f) == f) return i;
     return UINT32_MAX;
@@ -1144,18 +1143,57 @@ static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
 /*  C API                                                                    */
 /* ======================================================================== */
 
-int sigaw_overlay_init(VkDevice device, VkPhysicalDevice phys_device,
-                       VkInstance instance, uint32_t queue_family,
-                       VkQueue queue,
-                       PFN_vkGetPhysicalDeviceMemoryProperties get_phys_props,
-                       VkFormat format,
-                       uint32_t width, uint32_t height)
+static void destroy_overlay_context(Ctx* ctx, bool wait_idle)
 {
-    auto& c = G;
-    c.dev = device; c.pdev = phys_device; c.inst = instance;
-    c.qf = queue_family; c.q = queue;
+    if (!ctx) {
+        return;
+    }
+
+    if (wait_idle && ctx->dev != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(ctx->dev);
+    }
+    if (ctx->sptr) {
+        vkUnmapMemory(ctx->dev, ctx->smem);
+        ctx->sptr = nullptr;
+    }
+    if (ctx->sbuf) {
+        vkDestroyBuffer(ctx->dev, ctx->sbuf, nullptr);
+        ctx->sbuf = VK_NULL_HANDLE;
+    }
+    if (ctx->smem) {
+        vkFreeMemory(ctx->dev, ctx->smem, nullptr);
+        ctx->smem = VK_NULL_HANDLE;
+    }
+    if (ctx->fen) {
+        vkDestroyFence(ctx->dev, ctx->fen, nullptr);
+        ctx->fen = VK_NULL_HANDLE;
+    }
+    if (ctx->pool) {
+        vkDestroyCommandPool(ctx->dev, ctx->pool, nullptr);
+        ctx->pool = VK_NULL_HANDLE;
+    }
+    ctx->shm.close();
+    ctx->ok = false;
+}
+
+SigawOverlayContext* sigaw_overlay_create(VkDevice device, VkPhysicalDevice phys_device,
+                                          VkInstance instance, uint32_t queue_family,
+                                          VkQueue queue,
+                                          PFN_vkGetPhysicalDeviceMemoryProperties get_phys_props,
+                                          VkFormat format,
+                                          uint32_t width, uint32_t height)
+{
+    auto* ctx = new Ctx();
+    auto& c = *ctx;
+    c.dev = device;
+    c.pdev = phys_device;
+    c.inst = instance;
+    c.qf = queue_family;
+    c.q = queue;
     c.get_phys_props = get_phys_props;
-    c.fmt = format; c.sw = width; c.sh = height;
+    c.fmt = format;
+    c.sw = width;
+    c.sh = height;
     c.debug = std::getenv("SIGAW_DEBUG") != nullptr;
     c.logged_first_render = false;
     refresh_config(c, true);
@@ -1190,11 +1228,13 @@ int sigaw_overlay_init(VkDevice device, VkPhysicalDevice phys_device,
     VkMemoryAllocateInfo ma = {};
     ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ma.allocationSize = mr.size;
-    ma.memoryTypeIndex = find_mem(phys_device, mr.memoryTypeBits,
+    ma.memoryTypeIndex = find_mem(c, phys_device, mr.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (ma.memoryTypeIndex == UINT32_MAX) {
         fprintf(stderr, "[sigaw] Failed to find host-visible memory type for overlay staging buffer\n");
-        return 0;
+        destroy_overlay_context(ctx, false);
+        delete ctx;
+        return nullptr;
     }
     vkAllocateMemory(device, &ma, nullptr, &c.smem);
     vkBindBufferMemory(device, c.sbuf, c.smem, 0);
@@ -1202,29 +1242,33 @@ int sigaw_overlay_init(VkDevice device, VkPhysicalDevice phys_device,
 
     c.ok = true;
     fprintf(stderr, "[sigaw] Overlay initialized (%ux%u fmt=%d)\n", width, height, format);
-    return 1;
+    return reinterpret_cast<SigawOverlayContext*>(ctx);
 }
 
-void sigaw_overlay_shutdown(VkDevice device) {
-    auto& c = G;
-    if (!c.ok) return;
-    vkDeviceWaitIdle(device);
-    if (c.sptr) { vkUnmapMemory(device, c.smem); c.sptr = nullptr; }
-    if (c.sbuf) vkDestroyBuffer(device, c.sbuf, nullptr);
-    if (c.smem) vkFreeMemory(device, c.smem, nullptr);
-    if (c.fen)  vkDestroyFence(device, c.fen, nullptr);
-    if (c.pool) vkDestroyCommandPool(device, c.pool, nullptr);
-    c.shm.close();
-    c.ok = false;
+void sigaw_overlay_destroy(SigawOverlayContext* handle) {
+    auto* ctx = reinterpret_cast<Ctx*>(handle);
+    if (!ctx) {
+        return;
+    }
+
+    destroy_overlay_context(ctx, true);
+    delete ctx;
     fprintf(stderr, "[sigaw] Overlay shutdown\n");
 }
 
-void sigaw_overlay_resize(VkDevice, VkFormat format,
+void sigaw_overlay_resize(SigawOverlayContext* handle, VkFormat format,
                           uint32_t width, uint32_t height) {
-    G.fmt = format; G.sw = width; G.sh = height;
+    auto* ctx = reinterpret_cast<Ctx*>(handle);
+    if (!ctx) {
+        return;
+    }
+
+    ctx->fmt = format;
+    ctx->sw = width;
+    ctx->sh = height;
 }
 
-int sigaw_overlay_render(VkDevice device, VkQueue queue,
+int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
                          VkImage target_image, VkFormat format,
                          uint32_t width, uint32_t height,
                          uint32_t wait_sem_count,
@@ -1232,7 +1276,12 @@ int sigaw_overlay_render(VkDevice device, VkQueue queue,
                          VkSemaphore signal_sem,
                          VkFence /* fence */)
 {
-    auto& c = G;
+    auto* ctx = reinterpret_cast<Ctx*>(handle);
+    if (!ctx) {
+        return 0;
+    }
+
+    auto& c = *ctx;
     refresh_config(c);
     if (!c.ok || !c.cfg.visible) return 0;
 
@@ -1280,8 +1329,8 @@ int sigaw_overlay_render(VkDevice device, VkQueue queue,
         c.logged_first_render = true;
     }
 
-    vkWaitForFences(device, 1, &c.fen, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &c.fen);
+    vkWaitForFences(c.dev, 1, &c.fen, VK_TRUE, UINT64_MAX);
+    vkResetFences(c.dev, 1, &c.fen);
     vkResetCommandBuffer(c.cmd, 0);
 
     VkCommandBufferBeginInfo beg = {};
@@ -1329,10 +1378,10 @@ int sigaw_overlay_render(VkDevice device, VkQueue queue,
         return 0;
     }
 
-    vkWaitForFences(device, 1, &c.fen, VK_TRUE, UINT64_MAX);
+    vkWaitForFences(c.dev, 1, &c.fen, VK_TRUE, UINT64_MAX);
     c.panel.composite_over(c.sptr, format, cw, ch);
 
-    vkResetFences(device, 1, &c.fen);
+    vkResetFences(c.dev, 1, &c.fen);
     vkResetCommandBuffer(c.cmd, 0);
 
     vkBeginCommandBuffer(c.cmd, &beg);

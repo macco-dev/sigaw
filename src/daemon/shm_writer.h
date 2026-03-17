@@ -2,6 +2,7 @@
 #define SIGAW_SHM_WRITER_H
 
 #include "../common/protocol.h"
+#include "../common/config.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -22,8 +23,10 @@ public:
     bool open() {
         if (mapped_) return true;
 
+        const auto shm_name = Config::shared_memory_name();
+
         /* Create or open the shared memory segment */
-        fd_ = shm_open(SIGAW_SHM_NAME, O_CREAT | O_RDWR,
+        fd_ = shm_open(shm_name.c_str(), O_CREAT | O_RDWR,
                         S_IRUSR | S_IWUSR);
         if (fd_ < 0) {
             perror("[sigaw] shm_open");
@@ -57,7 +60,7 @@ public:
         state_->header.sequence = 0;
 
         fprintf(stderr, "[sigaw] Shared memory created: %s (%zu bytes)\n",
-                SIGAW_SHM_NAME, sizeof(SigawState));
+                shm_name.c_str(), sizeof(SigawState));
         return true;
     }
 
@@ -72,7 +75,8 @@ public:
         }
         if (mapped_) {
             /* Unlink the shm segment so it's cleaned up */
-            shm_unlink(SIGAW_SHM_NAME);
+            const auto shm_name = Config::shared_memory_name();
+            shm_unlink(shm_name.c_str());
         }
         mapped_ = false;
     }

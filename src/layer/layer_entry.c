@@ -18,6 +18,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdio.h>
+
+#include "swapchain_bookkeeping.h"
 
 #if defined(__GNUC__) || defined(__clang__)
 #define SIGAW_LAYER_EXPORT __attribute__((visibility("default")))
@@ -30,16 +33,18 @@
 extern "C" {
 #endif
 
-int sigaw_overlay_init(VkDevice device, VkPhysicalDevice phys_device,
-                       VkInstance instance, uint32_t queue_family,
-                       VkQueue queue,
-                       PFN_vkGetPhysicalDeviceMemoryProperties get_phys_props,
-                       VkFormat format,
-                       uint32_t width, uint32_t height);
-void sigaw_overlay_shutdown(VkDevice device);
-void sigaw_overlay_resize(VkDevice device, VkFormat format,
+typedef struct SigawOverlayContext SigawOverlayContext;
+
+SigawOverlayContext* sigaw_overlay_create(VkDevice device, VkPhysicalDevice phys_device,
+                                          VkInstance instance, uint32_t queue_family,
+                                          VkQueue queue,
+                                          PFN_vkGetPhysicalDeviceMemoryProperties get_phys_props,
+                                          VkFormat format,
+                                          uint32_t width, uint32_t height);
+void sigaw_overlay_destroy(SigawOverlayContext* ctx);
+void sigaw_overlay_resize(SigawOverlayContext* ctx, VkFormat format,
                           uint32_t width, uint32_t height);
-int sigaw_overlay_render(VkDevice device, VkQueue queue,
+int sigaw_overlay_render(SigawOverlayContext* ctx, VkQueue queue,
                          VkImage target_image, VkFormat format,
                          uint32_t width, uint32_t height,
                          uint32_t wait_sem_count,
@@ -93,18 +98,10 @@ typedef struct {
     uint32_t                    queue_count;
     uint32_t                    overlay_queue_family;
     VkSemaphore                 overlay_semaphore;
-    int                         overlay_initialized;
+    SigawOverlayContext*        overlay_ctx;
 } DeviceData;
 
-typedef struct {
-    VkSwapchainKHR swapchain;
-    VkDevice       device;
-    VkFormat       format;
-    uint32_t       width;
-    uint32_t       height;
-    VkImage*       images;
-    uint32_t       image_count;
-} SwapchainData;
+typedef SigawSwapchainData SwapchainData;
 
 static InstanceData  g_instances[MAX_INSTANCES];
 static int           g_instance_count = 0;
@@ -114,6 +111,7 @@ static int           g_device_count = 0;
 
 static SwapchainData g_swapchains[MAX_DEVICES * 4]; /* multiple swapchains per device */
 static int           g_swapchain_count = 0;
+static int           g_swapchain_full_warned = 0;
 
 /* Lookup helpers */
 static InstanceData* find_instance(VkInstance inst) {
@@ -145,10 +143,7 @@ static DeviceData* find_device_for_queue(VkQueue queue, uint32_t* queue_family) 
 }
 
 static SwapchainData* find_swapchain(VkSwapchainKHR sc) {
-    for (int i = 0; i < g_swapchain_count; i++) {
-        if (g_swapchains[i].swapchain == sc) return &g_swapchains[i];
-    }
-    return NULL;
+    return sigaw_find_swapchain(g_swapchains, g_swapchain_count, sc);
 }
 
 static int overlay_supports_format(VkFormat format) {
@@ -283,7 +278,7 @@ sigaw_CreateDevice(VkPhysicalDevice physicalDevice,
         data->queue_count = 0;
         data->overlay_queue_family = UINT32_MAX;
         data->overlay_semaphore = VK_NULL_HANDLE;
-        data->overlay_initialized = 0;
+        data->overlay_ctx = NULL;
 
         data->destroy_device =
             (PFN_vkDestroyDevice)get_device_proc(*pDevice, "vkDestroyDevice");
@@ -362,8 +357,10 @@ sigaw_DestroyDevice(VkDevice device,
 {
     DeviceData* data = find_device(device);
     if (data) {
-        if (data->overlay_initialized) {
-            sigaw_overlay_shutdown(device);
+        sigaw_release_swapchains_for_device(g_swapchains, &g_swapchain_count, device);
+        if (data->overlay_ctx) {
+            sigaw_overlay_destroy(data->overlay_ctx);
+            data->overlay_ctx = NULL;
         }
         if (data->overlay_semaphore) {
             PFN_vkDestroySemaphore destroy_semaphore =
@@ -373,6 +370,7 @@ sigaw_DestroyDevice(VkDevice device,
             }
             data->overlay_semaphore = VK_NULL_HANDLE;
         }
+        data->overlay_queue_family = UINT32_MAX;
         if (data->destroy_device) {
             data->destroy_device(device, pAllocator);
         }
@@ -394,8 +392,12 @@ sigaw_CreateSwapchainKHR(VkDevice device,
     if (result != VK_SUCCESS) return result;
 
     /* Record swapchain info */
-    if (g_swapchain_count < (int)(sizeof(g_swapchains)/sizeof(g_swapchains[0]))) {
-        SwapchainData* sc = &g_swapchains[g_swapchain_count++];
+    SwapchainData* sc = sigaw_allocate_swapchain_slot(
+        g_swapchains,
+        &g_swapchain_count,
+        (int)(sizeof(g_swapchains) / sizeof(g_swapchains[0]))
+    );
+    if (sc) {
         sc->swapchain = *pSwapchain;
         sc->device = device;
         sc->format = pCreateInfo->imageFormat;
@@ -408,12 +410,33 @@ sigaw_CreateSwapchainKHR(VkDevice device,
         dev->get_swapchain_images(device, *pSwapchain, &sc->image_count, sc->images);
 
         /* Keep renderer dimensions in sync once the overlay is active. */
-        if (dev->overlay_initialized) {
-            sigaw_overlay_resize(device, sc->format, sc->width, sc->height);
+        if (dev->overlay_ctx) {
+            sigaw_overlay_resize(dev->overlay_ctx, sc->format, sc->width, sc->height);
         }
+    } else if (!g_swapchain_full_warned) {
+        fprintf(stderr, "[sigaw] Swapchain bookkeeping table full; overlay tracking disabled for new swapchains\n");
+        g_swapchain_full_warned = 1;
     }
 
     return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+sigaw_DestroySwapchainKHR(VkDevice device,
+                          VkSwapchainKHR swapchain,
+                          const VkAllocationCallbacks* pAllocator)
+{
+    DeviceData* dev = find_device(device);
+    if (!dev || !dev->destroy_swapchain) {
+        return;
+    }
+
+    dev->destroy_swapchain(device, swapchain, pAllocator);
+
+    SwapchainData* sc = find_swapchain(swapchain);
+    if (sc) {
+        sigaw_release_swapchain(g_swapchains, &g_swapchain_count, sc);
+    }
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -443,21 +466,21 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
         }
     }
 
-    if (dev && !dev->overlay_initialized && dev->overlay_semaphore &&
+    if (dev && !dev->overlay_ctx && dev->overlay_semaphore &&
         pPresentInfo->swapchainCount > 0) {
         SwapchainData* sc = find_swapchain(pPresentInfo->pSwapchains[0]);
         InstanceData* inst_data = sc ? find_instance(dev->instance) : NULL;
         if (sc && inst_data && queue_family != UINT32_MAX) {
-            dev->overlay_initialized =
-                sigaw_overlay_init(dev->device, dev->phys_device, dev->instance,
-                                   queue_family, queue,
-                                   inst_data->get_mem_props,
-                                   sc->format, sc->width, sc->height);
-            if (dev->overlay_initialized) {
+            dev->overlay_ctx =
+                sigaw_overlay_create(dev->device, dev->phys_device, dev->instance,
+                                     queue_family, queue,
+                                     inst_data->get_mem_props,
+                                     sc->format, sc->width, sc->height);
+            if (dev->overlay_ctx) {
                 dev->overlay_queue_family = queue_family;
             }
         }
-    } else if (dev && dev->overlay_initialized && queue_family != UINT32_MAX &&
+    } else if (dev && dev->overlay_ctx && queue_family != UINT32_MAX &&
                dev->overlay_queue_family != UINT32_MAX &&
                dev->overlay_queue_family != queue_family) {
         SwapchainData* sc = NULL;
@@ -470,23 +493,23 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
             inst_data = find_instance(dev->instance);
         }
 
-        sigaw_overlay_shutdown(dev->device);
-        dev->overlay_initialized = 0;
+        sigaw_overlay_destroy(dev->overlay_ctx);
+        dev->overlay_ctx = NULL;
         dev->overlay_queue_family = UINT32_MAX;
 
         if (sc && inst_data) {
-            dev->overlay_initialized =
-                sigaw_overlay_init(dev->device, dev->phys_device, dev->instance,
-                                   queue_family, queue,
-                                   inst_data->get_mem_props,
-                                   sc->format, sc->width, sc->height);
-            if (dev->overlay_initialized) {
+            dev->overlay_ctx =
+                sigaw_overlay_create(dev->device, dev->phys_device, dev->instance,
+                                     queue_family, queue,
+                                     inst_data->get_mem_props,
+                                     sc->format, sc->width, sc->height);
+            if (dev->overlay_ctx) {
                 dev->overlay_queue_family = queue_family;
             }
         }
     }
 
-    if (dev && dev->overlay_initialized && dev->overlay_semaphore) {
+    if (dev && dev->overlay_ctx && dev->overlay_semaphore) {
         int last_overlay_index = -1;
         for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
             SwapchainData* sc = find_swapchain(pPresentInfo->pSwapchains[i]);
@@ -513,7 +536,7 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
                     }
 
                     if (sigaw_overlay_render(
-                        dev->device, queue,
+                        dev->overlay_ctx, queue,
                         sc->images[img_idx], sc->format,
                         sc->width, sc->height,
                         wait_count, wait_sems,
@@ -573,6 +596,7 @@ sigaw_GetDeviceProcAddr(VkDevice device, const char* pName)
     /* Functions we intercept */
     INTERCEPT(vkDestroyDevice, DestroyDevice);
     INTERCEPT(vkCreateSwapchainKHR, CreateSwapchainKHR);
+    INTERCEPT(vkDestroySwapchainKHR, DestroySwapchainKHR);
     INTERCEPT(vkQueuePresentKHR, QueuePresentKHR);
     INTERCEPT(vkGetDeviceProcAddr, GetDeviceProcAddr);
 

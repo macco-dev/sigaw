@@ -2,6 +2,7 @@
 #define SIGAW_SHM_READER_H
 
 #include "../common/protocol.h"
+#include "../common/config.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -9,12 +10,14 @@
 #include <string.h>
 #include <cstdio>
 #include <atomic>
+#include <chrono>
 
 namespace sigaw {
 
 class ShmReader {
 public:
-    ShmReader() = default;
+    explicit ShmReader(std::chrono::milliseconds probe_interval = std::chrono::milliseconds(250))
+        : probe_interval_(probe_interval) {}
     ~ShmReader() { close(); }
 
     /* Non-copyable */
@@ -22,22 +25,7 @@ public:
     ShmReader& operator=(const ShmReader&) = delete;
 
     bool open() {
-        if (mapped_) return true;
-
-        fd_ = shm_open(SIGAW_SHM_NAME, O_RDONLY, 0);
-        if (fd_ < 0) return false;
-
-        void* ptr = mmap(nullptr, sizeof(SigawState), PROT_READ,
-                         MAP_SHARED, fd_, 0);
-        if (ptr == MAP_FAILED) {
-            ::close(fd_);
-            fd_ = -1;
-            return false;
-        }
-
-        state_ = static_cast<const SigawState*>(ptr);
-        mapped_ = true;
-        return true;
+        return refresh_mapping(true);
     }
 
     void close() {
@@ -50,6 +38,9 @@ public:
             fd_ = -1;
         }
         mapped_ = false;
+        stat_valid_ = false;
+        state_ = nullptr;
+        last_seq_ = 0;
     }
 
     /*
@@ -58,9 +49,8 @@ public:
      * The caller-provided `out` is filled with a consistent snapshot.
      */
     bool read(SigawState& out) {
-        if (!mapped_) {
-            /* Try to connect on each read attempt (daemon may start later) */
-            if (!open()) return false;
+        if (!refresh_mapping(false)) {
+            return false;
         }
 
         /* Validate magic and version */
@@ -115,11 +105,73 @@ public:
     bool is_connected() const { return mapped_; }
 
 private:
+    bool same_object(const struct stat& a, const struct stat& b) const {
+        return a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+    }
+
+    bool adopt_mapping(int fd, const struct stat& st) {
+        void* ptr = mmap(nullptr, sizeof(SigawState), PROT_READ,
+                         MAP_SHARED, fd, 0);
+        if (ptr == MAP_FAILED) {
+            ::close(fd);
+            return false;
+        }
+
+        close();
+
+        fd_ = fd;
+        state_ = static_cast<const SigawState*>(ptr);
+        mapped_ = true;
+        mapped_stat_ = st;
+        stat_valid_ = true;
+        version_warned_ = false;
+        last_seq_ = 0;
+        return true;
+    }
+
+    bool refresh_mapping(bool force_probe) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force_probe && mapped_ && now < next_probe_) {
+            return true;
+        }
+
+        next_probe_ = now + probe_interval_;
+
+        const auto shm_name = Config::shared_memory_name();
+        const int probe_fd = shm_open(shm_name.c_str(), O_RDONLY, 0);
+        if (probe_fd < 0) {
+            if (mapped_) {
+                close();
+            }
+            return false;
+        }
+
+        struct stat probe_stat = {};
+        if (fstat(probe_fd, &probe_stat) < 0) {
+            ::close(probe_fd);
+            if (mapped_) {
+                close();
+            }
+            return false;
+        }
+
+        if (mapped_ && stat_valid_ && same_object(mapped_stat_, probe_stat)) {
+            ::close(probe_fd);
+            return true;
+        }
+
+        return adopt_mapping(probe_fd, probe_stat);
+    }
+
     int                  fd_            = -1;
     const SigawState*    state_         = nullptr;
     bool                 mapped_        = false;
+    bool                 stat_valid_    = false;
     bool                 version_warned_ = false;
     uint64_t             last_seq_      = 0;
+    struct stat          mapped_stat_   = {};
+    std::chrono::milliseconds probe_interval_;
+    std::chrono::steady_clock::time_point next_probe_ = {};
 };
 
 } /* namespace sigaw */

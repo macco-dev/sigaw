@@ -214,6 +214,30 @@ test(
   overlay_visibility_test,
 )
 
+shm_reader_test = executable(
+  'sigaw-shm-reader-test',
+  'tests/shm_reader_test.cpp',
+  include_directories: include_directories('src'),
+  dependencies: [rt_dep],
+)
+
+test(
+  'sigaw-shm-reader',
+  shm_reader_test,
+)
+
+swapchain_bookkeeping_test = executable(
+  'sigaw-swapchain-bookkeeping-test',
+  'tests/swapchain_bookkeeping_test.cpp',
+  include_directories: include_directories('src'),
+  dependencies: [vulkan_dep],
+)
+
+test(
+  'sigaw-swapchain-bookkeeping',
+  swapchain_bookkeeping_test,
+)
+
 daemon_voice_runtime_test = executable(
   'sigaw-daemon-voice-runtime-test',
   'tests/daemon_voice_runtime_test.cpp',

@@ -30,7 +30,8 @@ static void print_usage(const char* prog) {
 }
 
 static const SigawState* open_shm() {
-    int fd = shm_open(SIGAW_SHM_NAME, O_RDONLY, 0);
+    const auto shm_name = sigaw::Config::shared_memory_name();
+    int fd = shm_open(shm_name.c_str(), O_RDONLY, 0);
     if (fd < 0) return nullptr;
 
     void* ptr = mmap(nullptr, sizeof(SigawState), PROT_READ,

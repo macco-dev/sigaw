@@ -45,6 +45,7 @@ static bool wait_with_control(sigaw::ControlServer& ctl, sigaw::Config& config,
 }
 
 static void print_usage(const char* prog) {
+    const auto shm_name = sigaw::Config::shared_memory_name();
     fprintf(stderr,
         "sigaw-daemon - Discord voice overlay daemon\n"
         "\n"
@@ -57,7 +58,7 @@ static void print_usage(const char* prog) {
         "  --help           Show this help\n"
         "\n"
         "The daemon connects to Discord's local IPC socket and publishes\n"
-        "voice channel state to shared memory (" SIGAW_SHM_NAME ") for the\n"
+        "voice channel state to shared memory (%s) for the\n"
         "Vulkan overlay layer to read.\n"
         "\n"
         "Setup:\n"
@@ -65,7 +66,7 @@ static void print_usage(const char* prog) {
         "  2. Run: sigaw-daemon --foreground\n"
         "  3. Approve the authorization in Discord (one-time)\n"
         "  4. Launch games with: SIGAW=1 <game>\n",
-        prog
+        prog, shm_name.c_str()
     );
 }
 

@@ -16,7 +16,6 @@ extern "C" {
 #define SIGAW_MAGIC        0x53494741  /* "SIGA" */
 #define SIGAW_VERSION      2
 #define SIGAW_MAX_USERS    64
-#define SIGAW_SHM_NAME     "/sigaw-voice"
 #define SIGAW_SHM_SIZE     sizeof(struct SigawState)
 
 /* Socket path for daemon <-> ctl communication */
