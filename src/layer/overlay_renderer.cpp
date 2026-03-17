@@ -1413,5 +1413,8 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
     if (vkQueueSubmit(queue, 1, &sub, c.fen) != VK_SUCCESS) {
         return 0;
     }
+    if (!signal_sem) {
+        vkWaitForFences(c.dev, 1, &c.fen, VK_TRUE, UINT64_MAX);
+    }
     return 1;
 }

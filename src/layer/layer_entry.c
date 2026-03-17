@@ -97,7 +97,6 @@ typedef struct {
     uint32_t                    queue_families[MAX_DEVICE_QUEUES];
     uint32_t                    queue_count;
     uint32_t                    overlay_queue_family;
-    VkSemaphore                 overlay_semaphore;
     SigawOverlayContext*        overlay_ctx;
 } DeviceData;
 
@@ -277,7 +276,6 @@ sigaw_CreateDevice(VkPhysicalDevice physicalDevice,
         data->gfx_queue_family = gfx_family;
         data->queue_count = 0;
         data->overlay_queue_family = UINT32_MAX;
-        data->overlay_semaphore = VK_NULL_HANDLE;
         data->overlay_ctx = NULL;
 
         data->destroy_device =
@@ -336,16 +334,6 @@ sigaw_CreateDevice(VkPhysicalDevice physicalDevice,
             get_queue(*pDevice, gfx_family, 0, &data->gfx_queue);
         }
 
-        PFN_vkCreateSemaphore create_semaphore =
-            (PFN_vkCreateSemaphore)get_device_proc(*pDevice, "vkCreateSemaphore");
-        if (create_semaphore) {
-            VkSemaphoreCreateInfo sci = {
-                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-                .pNext = NULL,
-                .flags = 0,
-            };
-            create_semaphore(*pDevice, &sci, NULL, &data->overlay_semaphore);
-        }
     }
 
     return VK_SUCCESS;
@@ -361,14 +349,6 @@ sigaw_DestroyDevice(VkDevice device,
         if (data->overlay_ctx) {
             sigaw_overlay_destroy(data->overlay_ctx);
             data->overlay_ctx = NULL;
-        }
-        if (data->overlay_semaphore) {
-            PFN_vkDestroySemaphore destroy_semaphore =
-                (PFN_vkDestroySemaphore)data->get_proc(device, "vkDestroySemaphore");
-            if (destroy_semaphore) {
-                destroy_semaphore(device, data->overlay_semaphore, NULL);
-            }
-            data->overlay_semaphore = VK_NULL_HANDLE;
         }
         data->overlay_queue_family = UINT32_MAX;
         if (data->destroy_device) {
@@ -456,7 +436,6 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
     uint32_t queue_family = UINT32_MAX;
     DeviceData* dev = find_device_for_queue(queue, &queue_family);
     VkPresentInfoKHR present_info = *pPresentInfo;
-    VkSemaphore overlay_wait = VK_NULL_HANDLE;
     int overlay_rendered = 0;
 
     if (!dev && pPresentInfo->swapchainCount > 0) {
@@ -466,7 +445,7 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
         }
     }
 
-    if (dev && !dev->overlay_ctx && dev->overlay_semaphore &&
+    if (dev && !dev->overlay_ctx &&
         pPresentInfo->swapchainCount > 0) {
         SwapchainData* sc = find_swapchain(pPresentInfo->pSwapchains[0]);
         InstanceData* inst_data = sc ? find_instance(dev->instance) : NULL;
@@ -509,43 +488,23 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
         }
     }
 
-    if (dev && dev->overlay_ctx && dev->overlay_semaphore) {
-        int last_overlay_index = -1;
+    if (dev && dev->overlay_ctx && queue_family != UINT32_MAX &&
+        dev->overlay_queue_family == queue_family) {
         for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
             SwapchainData* sc = find_swapchain(pPresentInfo->pSwapchains[i]);
-            if (!sc || !sc->images || !overlay_supports_format(sc->format)) {
-                continue;
-            }
-
-            const uint32_t img_idx = pPresentInfo->pImageIndices[i];
-            if (img_idx < sc->image_count) {
-                last_overlay_index = (int)i;
-            }
-        }
-
-        for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
-            SwapchainData* sc = find_swapchain(pPresentInfo->pSwapchains[i]);
-            if (sc && sc->images) {
+            if (sc && sc->images && overlay_supports_format(sc->format)) {
                 uint32_t img_idx = pPresentInfo->pImageIndices[i];
                 if (img_idx < sc->image_count) {
                     const uint32_t wait_count = overlay_rendered ? 0u : pPresentInfo->waitSemaphoreCount;
                     const VkSemaphore* wait_sems = overlay_rendered ? NULL : pPresentInfo->pWaitSemaphores;
-                    VkSemaphore signal_sem = VK_NULL_HANDLE;
-                    if ((int)i == last_overlay_index) {
-                        signal_sem = dev->overlay_semaphore;
-                    }
-
                     if (sigaw_overlay_render(
                         dev->overlay_ctx, queue,
                         sc->images[img_idx], sc->format,
                         sc->width, sc->height,
                         wait_count, wait_sems,
-                        signal_sem, VK_NULL_HANDLE
+                        VK_NULL_HANDLE, VK_NULL_HANDLE
                     )) {
                         overlay_rendered = 1;
-                        if (signal_sem) {
-                            overlay_wait = signal_sem;
-                        }
                     }
                 }
             }
@@ -554,9 +513,9 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 
     /* Chain to the real present */
     if (dev && dev->queue_present) {
-        if (overlay_rendered && overlay_wait) {
-            present_info.waitSemaphoreCount = 1;
-            present_info.pWaitSemaphores = &overlay_wait;
+        if (overlay_rendered) {
+            present_info.waitSemaphoreCount = 0;
+            present_info.pWaitSemaphores = NULL;
             return dev->queue_present(queue, &present_info);
         }
         return dev->queue_present(queue, pPresentInfo);
