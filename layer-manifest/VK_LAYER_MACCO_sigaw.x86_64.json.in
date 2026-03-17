@@ -1,0 +1,21 @@
+{
+    "file_format_version": "1.0.0",
+    "layer": {
+        "name": "VK_LAYER_MACCO_sigaw",
+        "type": "GLOBAL",
+        "api_version": "1.3.0",
+        "library_path": "@layer_library_path@",
+        "implementation_version": "1",
+        "description": "Sigaw - Discord voice overlay",
+        "functions": {
+            "vkGetInstanceProcAddr": "sigaw_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "sigaw_GetDeviceProcAddr"
+        },
+        "enable_environment": {
+            "SIGAW": "1"
+        },
+        "disable_environment": {
+            "DISABLE_SIGAW": "1"
+        }
+    }
+}

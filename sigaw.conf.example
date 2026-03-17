@@ -1,0 +1,42 @@
+# Sigaw - Discord Voice Overlay for Linux
+# https://git.macco.dev/macco/sigaw
+#
+# Configuration file
+# Default location: ~/.config/sigaw/sigaw.conf
+
+# ---- Overlay Appearance ----
+
+# Position: top-left, top-right, bottom-left, bottom-right
+position=top-right
+
+# Scale multiplier (1.0 = default, 1.5 = 150%, etc.)
+scale=1.0
+
+# Overlay opacity (0.0 = fully transparent, 1.0 = fully opaque)
+opacity=0.72
+
+# Show user avatars (initials fallback when avatar unavailable)
+show_avatars=true
+
+# Show channel name header
+show_channel_name=false
+
+# Compact mode: small icons only, no usernames
+compact=false
+
+# Maximum users to display before truncating
+max_visible_users=8
+
+# Persisted overlay visibility (managed by sigaw-ctl)
+visible=true
+
+# ---- Discord Application Credentials ----
+#
+# Sigaw ships with public default credentials.
+# Replace these only if you want to use your own Discord application.
+#
+# The first time you run sigaw-daemon, Discord will show an authorization
+# popup. Click "Authorize" to grant voice read access.
+
+client_id=1483519089719640105
+client_secret=HD2VNfR0HxOiLSMM842PMDDv-SbW1r6Z

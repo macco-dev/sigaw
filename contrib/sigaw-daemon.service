@@ -1,0 +1,22 @@
+[Unit]
+Description=Sigaw - Discord voice overlay daemon
+Documentation=https://git.macco.dev/macco/sigaw
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sigaw-daemon --foreground
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/dev/shm
+ReadWritePaths=%t
+ReadWritePaths=%h/.config/sigaw
+ReadWritePaths=%h/.cache/sigaw
+
+[Install]
+WantedBy=default.target

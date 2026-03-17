@@ -1,0 +1,11 @@
+{
+  global:
+    sigaw_GetInstanceProcAddr;
+    sigaw_GetDeviceProcAddr;
+    sigaw_NegotiateLoaderLayerInterfaceVersion;
+    vkGetInstanceProcAddr;
+    vkGetDeviceProcAddr;
+    vkNegotiateLoaderLayerInterfaceVersion;
+  local:
+    *;
+};

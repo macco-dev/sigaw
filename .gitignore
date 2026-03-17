@@ -1,0 +1,9 @@
+build/
+builddir/
+subprojects/
+*.o
+*.so
+*.a
+*.d
+.cache/
+compile_commands.json
