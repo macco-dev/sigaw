@@ -21,6 +21,7 @@
 #include "overlay_visibility.h"
 #include "shm_reader.h"
 #include "../common/config.h"
+#include "../common/config_watcher.h"
 #include "../common/protocol.h"
 
 extern "C" {
@@ -836,12 +837,10 @@ struct Ctx {
 
     sigaw::ShmReader shm;
     sigaw::Config    cfg;
+    sigaw::ConfigWatcher cfg_watch;
     PBuf             panel;
     TextSystem       text;
     AvatarStore      avatars;
-    std::chrono::steady_clock::time_point next_cfg_refresh = {};
-    std::filesystem::file_time_type       cfg_mtime = {};
-    bool                                  cfg_has_mtime = false;
     bool             debug = false;
     bool             logged_first_render = false;
     bool             ok = false;
@@ -878,35 +877,14 @@ static uint32_t find_mem(Ctx& ctx, VkPhysicalDevice pd, uint32_t bits, VkMemoryP
 
 static void refresh_config(Ctx& ctx, bool force = false)
 {
-    const auto now = std::chrono::steady_clock::now();
-    if (!force && now < ctx.next_cfg_refresh) {
-        return;
-    }
-
-    ctx.next_cfg_refresh = now + std::chrono::milliseconds(250);
-
-    const auto path = sigaw::Config::config_path();
-    std::error_code ec;
-    const bool exists = std::filesystem::exists(path, ec);
-    if (ec) {
-        return;
-    }
-
-    if (!exists) {
+    if (force) {
         ctx.cfg = sigaw::Config::load();
-        ctx.cfg_has_mtime = false;
+        ctx.cfg_watch.sync();
         return;
     }
 
-    const auto mtime = std::filesystem::last_write_time(path, ec);
-    if (ec) {
-        return;
-    }
-
-    if (force || !ctx.cfg_has_mtime || mtime != ctx.cfg_mtime) {
+    if (ctx.cfg_watch.consume_change()) {
         ctx.cfg = sigaw::Config::load();
-        ctx.cfg_mtime = mtime;
-        ctx.cfg_has_mtime = true;
     }
 }
 

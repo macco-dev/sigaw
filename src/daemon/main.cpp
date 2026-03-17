@@ -16,6 +16,7 @@
 #include "shm_writer.h"
 #include "voice_runtime.h"
 #include "../common/config.h"
+#include "../common/config_watcher.h"
 #include "../common/protocol.h"
 
 static volatile sig_atomic_t g_running = 1;
@@ -24,10 +25,30 @@ static void signal_handler(int) {
     g_running = 0;
 }
 
+static bool daemon_requires_reconnect(const sigaw::Config& current,
+                                      const sigaw::Config& updated)
+{
+    return current.client_id != updated.client_id ||
+           current.client_secret != updated.client_secret;
+}
+
 static bool wait_with_control(sigaw::ControlServer& ctl, sigaw::Config& config,
+                              sigaw::ConfigWatcher* config_watcher,
                               int total_ms, bool* reconnect_requested = nullptr)
 {
     for (int elapsed = 0; elapsed < total_ms && g_running; elapsed += 100) {
+        if (config_watcher && config_watcher->consume_change()) {
+            const auto updated = sigaw::Config::load();
+            const bool reconnect = daemon_requires_reconnect(config, updated);
+            config = updated;
+            if (reconnect) {
+                if (reconnect_requested) {
+                    *reconnect_requested = true;
+                }
+                return false;
+            }
+        }
+
         const auto action = ctl.process_pending(config);
         if (action == sigaw::ControlServer::Action::Quit) {
             g_running = 0;
@@ -136,6 +157,8 @@ int main(int argc, char** argv) {
 
     /* Load config */
     sigaw::Config config = sigaw::Config::load();
+    sigaw::ConfigWatcher config_watcher;
+    config_watcher.sync();
 
     if (init_config) {
         config.write_default();
@@ -191,13 +214,13 @@ int main(int argc, char** argv) {
 
             if (!ipc.connect()) {
                 fprintf(stderr, "[sigaw] Discord not found, retrying in 5s...\n");
-                wait_with_control(ctl, config, 5000);
+                wait_with_control(ctl, config, &config_watcher, 5000);
                 continue;
             }
 
             if (!ipc.handshake()) {
                 fprintf(stderr, "[sigaw] Handshake failed, retrying in 5s...\n");
-                wait_with_control(ctl, config, 5000);
+                wait_with_control(ctl, config, &config_watcher, 5000);
                 continue;
             }
 
@@ -205,7 +228,7 @@ int main(int argc, char** argv) {
             if (!ipc.authorize(config.client_secret)) {
                 fprintf(stderr, "[sigaw] Auth failed (check client_id/secret)\n");
                 fprintf(stderr, "[sigaw] Retrying in 10s...\n");
-                wait_with_control(ctl, config, 10000);
+                wait_with_control(ctl, config, &config_watcher, 10000);
                 continue;
             }
 
@@ -281,6 +304,15 @@ int main(int argc, char** argv) {
                     update_shm(shm, runtime.voice, avatar_cache);
                 }
 
+                if (config_watcher.consume_change()) {
+                    const auto updated = sigaw::Config::load();
+                    reconnect_requested = daemon_requires_reconnect(config, updated);
+                    config = updated;
+                    if (reconnect_requested) {
+                        break;
+                    }
+                }
+
                 const auto action = ctl.process_pending(config);
                 if (action == sigaw::ControlServer::Action::Quit) {
                     g_running = 0;
@@ -307,7 +339,7 @@ int main(int argc, char** argv) {
             }
 
             if (!reconnect_requested) {
-                wait_with_control(ctl, config, 2000);
+                wait_with_control(ctl, config, &config_watcher, 2000);
             }
         }
     }
