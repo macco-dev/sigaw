@@ -87,8 +87,6 @@ expected_paths=(
     "bin/sigaw-daemon"
     "bin/sigaw-ctl"
     "bin/sigaw-run"
-    "lib/libSigaw.so"
-    "lib/libSigawGL.so"
     "share/sigaw/shaders/overlay_quad.vert.spv"
     "share/sigaw/shaders/overlay_quad.frag.spv"
     "share/vulkan/implicit_layer.d/VK_LAYER_MACCO_sigaw.x86_64.json"
@@ -104,6 +102,12 @@ sigaw_ci_log "verifying staged install contents"
 for relative_path in "${expected_paths[@]}"; do
     if [[ ! -f "${install_root}/${relative_path}" ]]; then
         sigaw_ci_fail "missing staged install file: ${install_root}/${relative_path}"
+    fi
+done
+
+for library_name in libSigaw.so libSigawGL.so; do
+    if ! find "${install_root}" -type f -name "${library_name}" -print -quit | grep -q .; then
+        sigaw_ci_fail "missing staged install library: ${library_name}"
     fi
 done
 

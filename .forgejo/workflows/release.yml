@@ -60,8 +60,6 @@ jobs:
           fi
 
       - name: Publish Forgejo release
-        env:
-          FORGEJO_RELEASE_TOKEN: ${{ secrets.FORGEJO_RELEASE_TOKEN }}
         run: |
           contrib/ci/publish-forgejo-release.sh \
             --tag "${FORGEJO_REF_NAME}" \
