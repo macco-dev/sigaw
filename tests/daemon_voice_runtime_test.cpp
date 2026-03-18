@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "daemon/chat_runtime.h"
 #include "daemon/voice_runtime.h"
 
 namespace {
@@ -242,6 +243,158 @@ bool test_voice_state_update_reads_nested_voice_state_flags() {
     return true;
 }
 
+bool test_chat_history_loads_oldest_to_newest_and_trims() {
+    sigaw::VoiceState voice;
+    const json history = json::array({
+        {
+            {"id", "303"},
+            {"author", {{"id", "3"}, {"username", "Gamma"}}},
+            {"content", "third"},
+        },
+        {
+            {"id", "202"},
+            {"author", {{"id", "2"}, {"username", "Beta"}}},
+            {"content", "second"},
+        },
+        {
+            {"id", "101"},
+            {"author", {{"id", "1"}, {"username", "Alpha"}}},
+            {"content", "first"},
+        },
+    });
+
+    if (!sigaw::chat::load_chat_history(voice, history, 1000, 2)) {
+        std::cerr << "expected chat history load to succeed\n";
+        return false;
+    }
+    if (voice.chat_messages.size() != 2 ||
+        voice.chat_messages[0].id != 202 ||
+        voice.chat_messages[1].id != 303) {
+        std::cerr << "chat history should keep the most recent messages in chronological order\n";
+        return false;
+    }
+
+    return true;
+}
+
+bool test_chat_event_sanitizes_attachment_and_updates_order() {
+    sigaw::VoiceState voice;
+
+    const json create = {
+        {"cmd", "DISPATCH"},
+        {"evt", "MESSAGE_CREATE"},
+        {"data", {
+            {"channel_id", "444"},
+            {"message", {
+                {"id", "77"},
+                {"author", {
+                    {"id", "5"},
+                    {"username", "Pilot"},
+                }},
+                {"content", "I\ncan't\t type"},
+            }},
+        }},
+    };
+
+    if (!sigaw::chat::process_chat_event(create, voice, 5'000)) {
+        std::cerr << "chat create event should append a message\n";
+        return false;
+    }
+    if (voice.chat_messages.size() != 1 ||
+        voice.chat_messages.front().content != "I can't type") {
+        std::cerr << "chat content should collapse whitespace to a single line\n";
+        return false;
+    }
+
+    const json attachment_update = {
+        {"cmd", "DISPATCH"},
+        {"evt", "MESSAGE_UPDATE"},
+        {"data", {
+            {"channel_id", "444"},
+            {"message", {
+                {"id", "77"},
+                {"attachments", json::array({{{"id", "999"}}})},
+                {"content", ""},
+            }},
+        }},
+    };
+
+    if (!sigaw::chat::process_chat_event(attachment_update, voice, 9'000)) {
+        std::cerr << "chat update event should keep attachment-only messages\n";
+        return false;
+    }
+    if (voice.chat_messages.front().content != "[attachment]" ||
+        voice.chat_messages.front().observed_at_ms != 9'000) {
+        std::cerr << "attachment-only updates should reset fade timing\n";
+        return false;
+    }
+
+    return true;
+}
+
+bool test_chat_delete_and_prune_remove_messages() {
+    sigaw::VoiceState voice;
+    sigaw::VoiceChatMessage old_message;
+    old_message.id = 11;
+    old_message.author_name = "Old";
+    old_message.content = "expired";
+    old_message.observed_at_ms = 1;
+    sigaw::VoiceChatMessage fresh_message;
+    fresh_message.id = 22;
+    fresh_message.author_name = "Fresh";
+    fresh_message.content = "still here";
+    fresh_message.observed_at_ms = 20'000;
+    voice.chat_messages = {old_message, fresh_message};
+
+    if (!sigaw::chat::prune_expired_messages(voice, sigaw::chat::total_lifetime_ms + 1)) {
+        std::cerr << "expected expired chat messages to be pruned\n";
+        return false;
+    }
+    if (voice.chat_messages.size() != 1 || voice.chat_messages.front().id != 22) {
+        std::cerr << "chat prune should keep only unexpired messages\n";
+        return false;
+    }
+
+    const json remove = {
+        {"cmd", "DISPATCH"},
+        {"evt", "MESSAGE_DELETE"},
+        {"data", {
+            {"channel_id", "444"},
+            {"message", {{"id", "22"}}},
+        }},
+    };
+    if (!sigaw::chat::process_chat_event(remove, voice, 25'000) || !voice.chat_messages.empty()) {
+        std::cerr << "chat delete should remove the matching message\n";
+        return false;
+    }
+
+    return true;
+}
+
+bool test_chat_timeout_tracks_hold_and_fade_windows() {
+    sigaw::VoiceState voice;
+    sigaw::VoiceChatMessage message;
+    message.id = 91;
+    message.author_name = "Timer";
+    message.content = "countdown";
+    message.observed_at_ms = 1'000;
+    voice.chat_messages.push_back(message);
+
+    const int before_fade = sigaw::chat::next_timeout_ms(voice, 5'000, 250);
+    if (before_fade != 250) {
+        std::cerr << "chat timeout should stay at the existing poll cadence until fade starts\n";
+        return false;
+    }
+
+    const int start_fade = sigaw::chat::next_timeout_ms(voice, 10'900, 10'000);
+    if (start_fade != 100) {
+        std::cerr << "chat timeout should tighten to the fade repaint cadence\n";
+        return false;
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -258,6 +411,18 @@ int main() {
     }
 
     if (!test_voice_state_update_reads_nested_voice_state_flags()) {
+        return 1;
+    }
+    if (!test_chat_history_loads_oldest_to_newest_and_trims()) {
+        return 1;
+    }
+    if (!test_chat_event_sanitizes_attachment_and_updates_order()) {
+        return 1;
+    }
+    if (!test_chat_delete_and_prune_remove_messages()) {
+        return 1;
+    }
+    if (!test_chat_timeout_tracks_hold_and_fade_windows()) {
         return 1;
     }
 

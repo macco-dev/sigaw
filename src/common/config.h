@@ -1,6 +1,7 @@
 #ifndef SIGAW_CONFIG_H
 #define SIGAW_CONFIG_H
 
+#include <algorithm>
 #include <string>
 #include <filesystem>
 #include <fstream>
@@ -9,6 +10,8 @@
 #include <cstdlib>
 #include <system_error>
 #include <unistd.h>
+
+#include "protocol.h"
 
 namespace sigaw {
 
@@ -26,8 +29,10 @@ struct Config {
     float           opacity      = 0.72f;
     bool            show_avatars = true;
     bool            show_channel = false;
+    bool            show_voice_channel_chat = false;
     bool            compact      = false;
     int             max_visible  = 8;
+    int             max_visible_chat_messages = 4;
 
     /* Daemon settings */
     std::string client_id        = "1483519089719640105";  /* Discord application ID */
@@ -131,8 +136,15 @@ struct Config {
         cfg.opacity      = get_float("opacity", cfg.opacity);
         cfg.show_avatars = get_bool("show_avatars", cfg.show_avatars);
         cfg.show_channel = get_bool("show_channel_name", cfg.show_channel);
+        cfg.show_voice_channel_chat =
+            get_bool("show_voice_channel_chat", cfg.show_voice_channel_chat);
         cfg.compact      = get_bool("compact", cfg.compact);
         cfg.max_visible  = get_int("max_visible_users", cfg.max_visible);
+        cfg.max_visible_chat_messages = std::clamp(
+            get_int("max_visible_chat_messages", cfg.max_visible_chat_messages),
+            1,
+            SIGAW_MAX_CHAT_MESSAGES
+        );
         cfg.visible      = get_bool("visible", cfg.visible);
 
         if (const auto client_id = get_str("client_id"); !client_id.empty()) {
@@ -297,11 +309,17 @@ private:
           << "# Show channel name at the top\n"
           << "show_channel_name=" << (show_channel ? "true" : "false") << "\n"
           << "\n"
+          << "# Show the latest voice channel chat messages under the user list\n"
+          << "show_voice_channel_chat=" << (show_voice_channel_chat ? "true" : "false") << "\n"
+          << "\n"
           << "# Compact mode (small icons, no usernames)\n"
           << "compact=" << (compact ? "true" : "false") << "\n"
           << "\n"
           << "# Maximum users to display\n"
           << "max_visible_users=" << max_visible << "\n"
+          << "\n"
+          << "# Maximum voice channel chat messages to display\n"
+          << "max_visible_chat_messages=" << max_visible_chat_messages << "\n"
           << "\n"
           << "# Persisted overlay visibility (managed by sigaw-ctl)\n"
           << "visible=" << (visible ? "true" : "false") << "\n"

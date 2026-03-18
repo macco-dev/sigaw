@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "avatar_cache.h"
+#include "chat_runtime.h"
 #include "control_server.h"
 #include "discord_ipc.h"
 #include "json_utils.h"
@@ -32,10 +33,14 @@ static void signal_handler(int) {
 }
 
 static bool daemon_requires_reconnect(const sigaw::Config& current,
-                                      const sigaw::Config& updated)
+                                      const sigaw::Config& updated,
+                                      bool have_messages_read_scope = false)
 {
     return current.client_id != updated.client_id ||
-           current.client_secret != updated.client_secret;
+           current.client_secret != updated.client_secret ||
+           (!current.show_voice_channel_chat &&
+            updated.show_voice_channel_chat &&
+            !have_messages_read_scope);
 }
 
 static bool wait_with_control(sigaw::ControlServer& ctl, sigaw::Config& config,
@@ -122,6 +127,22 @@ static void update_shm(sigaw::ShmWriter& shm,
                          u.speaking, u.self_mute, u.self_deaf,
                          u.server_mute, u.server_deaf);
         }
+
+        shm.clear_chat();
+        count = std::min((uint32_t)voice.chat_messages.size(),
+                         (uint32_t)SIGAW_MAX_CHAT_MESSAGES);
+        shm.set_chat_count(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& message = voice.chat_messages[i];
+            shm.set_chat_message(
+                i,
+                message.id,
+                message.author_id,
+                message.observed_at_ms,
+                message.author_name.c_str(),
+                message.content.c_str()
+            );
+        }
     }
 
     shm.end_write();
@@ -129,6 +150,8 @@ static void update_shm(sigaw::ShmWriter& shm,
 
 static SigawState make_overlay_state(const sigaw::VoiceState& voice) {
     SigawState state = {};
+    state.header.magic = SIGAW_MAGIC;
+    state.header.version = SIGAW_VERSION;
     if (voice.channel_id.empty()) {
         return state;
     }
@@ -161,6 +184,29 @@ static SigawState make_overlay_state(const sigaw::VoiceState& voice) {
         dst.server_mute = src.server_mute ? 1u : 0u;
         dst.server_deaf = src.server_deaf ? 1u : 0u;
         dst.suppress = 0u;
+    }
+
+    const uint32_t chat_count = std::min(
+        static_cast<uint32_t>(voice.chat_messages.size()),
+        static_cast<uint32_t>(SIGAW_MAX_CHAT_MESSAGES)
+    );
+    state.chat_count = chat_count;
+    for (uint32_t i = 0; i < chat_count; ++i) {
+        const auto& src = voice.chat_messages[i];
+        auto& dst = state.chat_messages[i];
+        dst.message_id = src.id;
+        dst.author_id = src.author_id;
+        dst.observed_at_ms = src.observed_at_ms;
+
+        const size_t author_len = std::min(src.author_name.size(), sizeof(dst.author_name) - 1);
+        std::memcpy(dst.author_name, src.author_name.data(), author_len);
+        dst.author_name[author_len] = '\0';
+        dst.author_name_len = static_cast<uint32_t>(author_len);
+
+        const size_t content_len = std::min(src.content.size(), sizeof(dst.content) - 1);
+        std::memcpy(dst.content, src.content.data(), content_len);
+        dst.content[content_len] = '\0';
+        dst.content_len = static_cast<uint32_t>(content_len);
     }
 
     return state;
@@ -211,6 +257,80 @@ static void publish_overlay_frame(sigaw::OverlayFrameWriter& writer,
     if (!writer.publish(build_overlay_frame(voice, config))) {
         fprintf(stderr, "[sigaw] Failed to publish overlay frame\n");
     }
+}
+
+static bool chat_requested(const sigaw::Config& config) {
+    return config.show_voice_channel_chat && config.max_visible_chat_messages > 0;
+}
+
+static void unsubscribe_chat_events(sigaw::VoiceRuntimeState& runtime,
+                                    sigaw::DiscordIpc& ipc)
+{
+    if (!runtime.subscribed_chat_channel_id.empty()) {
+        (void)ipc.unsubscribe_channel_messages(runtime.subscribed_chat_channel_id);
+        runtime.subscribed_chat_channel_id.clear();
+    }
+    runtime.live_chat_events = false;
+}
+
+static bool clear_chat_state(sigaw::VoiceRuntimeState& runtime,
+                             sigaw::DiscordIpc* ipc = nullptr)
+{
+    const bool had_chat =
+        !runtime.voice.chat_messages.empty() ||
+        !runtime.active_chat_channel_id.empty() ||
+        !runtime.subscribed_chat_channel_id.empty();
+
+    if (ipc) {
+        unsubscribe_chat_events(runtime, *ipc);
+    } else {
+        runtime.subscribed_chat_channel_id.clear();
+        runtime.live_chat_events = false;
+    }
+    runtime.active_chat_channel_id.clear();
+    runtime.voice.chat_messages.clear();
+    return had_chat;
+}
+
+static bool refresh_chat_state(sigaw::VoiceRuntimeState& runtime,
+                               sigaw::DiscordIpc& ipc,
+                               const sigaw::Config& config)
+{
+    const bool want_chat = chat_requested(config) && ipc.has_scope("messages.read");
+    if (!want_chat || runtime.voice.channel_id.empty()) {
+        return clear_chat_state(runtime, &ipc);
+    }
+
+    if (runtime.active_chat_channel_id == runtime.voice.channel_id) {
+        return false;
+    }
+
+    const bool had_chat = clear_chat_state(runtime, &ipc);
+    runtime.active_chat_channel_id = runtime.voice.channel_id;
+
+    json history = json::array();
+    bool loaded_history = false;
+    if (!ipc.get_channel_messages(runtime.voice.channel_id, SIGAW_MAX_CHAT_MESSAGES, history)) {
+        fprintf(stderr,
+                "[sigaw] Voice channel chat history unavailable for %s; continuing with live updates only\n",
+                runtime.voice.channel_name.c_str());
+    } else {
+        const uint64_t now_ms = sigaw::chat::steady_clock_now_ms();
+        loaded_history = sigaw::chat::load_chat_history(
+            runtime.voice, history, now_ms, SIGAW_MAX_CHAT_MESSAGES
+        );
+    }
+
+    if (!ipc.subscribe_channel_messages(runtime.voice.channel_id)) {
+        fprintf(stderr,
+                "[sigaw] Voice channel chat live updates unavailable for %s\n",
+                runtime.voice.channel_name.c_str());
+        return had_chat || loaded_history;
+    }
+
+    runtime.subscribed_chat_channel_id = runtime.voice.channel_id;
+    runtime.live_chat_events = true;
+    return had_chat || loaded_history;
 }
 
 int main(int argc, char** argv) {
@@ -318,7 +438,13 @@ int main(int argc, char** argv) {
             }
 
             /* Authenticate */
-            if (!ipc.authorize(config.client_secret)) {
+            bool authorized = ipc.authorize(config.client_secret, chat_requested(config));
+            if (!authorized && chat_requested(config)) {
+                fprintf(stderr,
+                        "[sigaw] Chat authorization failed; continuing with voice-only overlay\n");
+                authorized = ipc.authorize(config.client_secret, false);
+            }
+            if (!authorized) {
                 fprintf(stderr, "[sigaw] Auth failed (check client_id/secret)\n");
                 fprintf(stderr, "[sigaw] Retrying in 10s...\n");
                 wait_with_control(ctl, config, &config_watcher, 10000);
@@ -351,6 +477,7 @@ int main(int argc, char** argv) {
                         runtime.voice.channel_name.c_str(), runtime.voice.users.size());
             }
 
+            (void)refresh_chat_state(runtime, ipc, config);
             update_shm(shm, runtime.voice, avatar_cache);
             publish_overlay_frame(overlay_frame, runtime.voice, config);
 
@@ -364,13 +491,21 @@ int main(int argc, char** argv) {
                 bool closed = false;
 
                 int timeout_ms = 250;
+                const auto timeout_now = std::chrono::steady_clock::now();
                 if (runtime.pending_sync.active()) {
-                    const auto now = std::chrono::steady_clock::now();
                     const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        runtime.pending_sync.next_attempt - now
+                        runtime.pending_sync.next_attempt - timeout_now
                     ).count();
                     timeout_ms = std::clamp(static_cast<int>(delay), 0, timeout_ms);
                 }
+                timeout_ms = std::min(
+                    timeout_ms,
+                    sigaw::chat::next_timeout_ms(
+                        runtime.voice,
+                        sigaw::chat::steady_clock_ms(timeout_now),
+                        timeout_ms
+                    )
+                );
 
                 struct pollfd fds[2] = {};
                 nfds_t fd_count = 0;
@@ -395,19 +530,37 @@ int main(int argc, char** argv) {
                     }
 
                     try {
-                        const auto update = sigaw::process_voice_event(
-                            event, runtime, ipc, std::chrono::steady_clock::now(), sync_config
-                        );
-                        if (update.left_channel) {
-                            fprintf(stderr, "[sigaw] Left voice channel\n");
+                        const auto now = std::chrono::steady_clock::now();
+                        const auto evt_name = sigaw::json_utils::string_or(event, "evt");
+                        if (evt_name == "MESSAGE_CREATE" ||
+                            evt_name == "MESSAGE_UPDATE" ||
+                            evt_name == "MESSAGE_DELETE") {
+                            if (!runtime.voice.channel_id.empty() &&
+                                runtime.active_chat_channel_id == runtime.voice.channel_id &&
+                                sigaw::chat::process_chat_event(
+                                    event,
+                                    runtime.voice,
+                                    sigaw::chat::steady_clock_ms(now),
+                                    SIGAW_MAX_CHAT_MESSAGES
+                                )) {
+                                state_changed = true;
+                                overlay_dirty = true;
+                            }
+                        } else {
+                            const auto update = sigaw::process_voice_event(
+                                event, runtime, ipc, now, sync_config
+                            );
+                            if (update.left_channel) {
+                                fprintf(stderr, "[sigaw] Left voice channel\n");
+                            }
+                            if (!update.user_joined.empty()) {
+                                fprintf(stderr, "[sigaw] + %s\n", update.user_joined.c_str());
+                            }
+                            if (!update.user_left.empty()) {
+                                fprintf(stderr, "[sigaw] - %s\n", update.user_left.c_str());
+                            }
+                            state_changed = state_changed || update.state_changed;
                         }
-                        if (!update.user_joined.empty()) {
-                            fprintf(stderr, "[sigaw] + %s\n", update.user_joined.c_str());
-                        }
-                        if (!update.user_left.empty()) {
-                            fprintf(stderr, "[sigaw] - %s\n", update.user_left.c_str());
-                        }
-                        state_changed = state_changed || update.state_changed;
                     } catch (const std::exception& e) {
                         fprintf(stderr, "[sigaw] Ignoring malformed Discord event: %s\n",
                                 e.what());
@@ -426,6 +579,18 @@ int main(int argc, char** argv) {
                             runtime.voice.channel_name.c_str(), runtime.voice.users.size());
                 }
                 state_changed = state_changed || sync_update.state_changed;
+                const bool chat_state_changed = refresh_chat_state(runtime, ipc, config);
+                state_changed = state_changed || chat_state_changed;
+                overlay_dirty = overlay_dirty || chat_state_changed;
+
+                const uint64_t now_ms = sigaw::chat::steady_clock_now_ms();
+                if (sigaw::chat::prune_expired_messages(runtime.voice, now_ms)) {
+                    state_changed = true;
+                    overlay_dirty = true;
+                }
+                if (sigaw::chat::repaint_due(runtime.voice, now_ms)) {
+                    overlay_dirty = true;
+                }
 
                 if (state_changed) {
                     update_shm(shm, runtime.voice, avatar_cache);
@@ -435,7 +600,9 @@ int main(int argc, char** argv) {
                 if (config_watcher.consume_change()) {
                     const auto current = config;
                     const auto updated = sigaw::Config::load();
-                    reconnect_requested = daemon_requires_reconnect(current, updated);
+                    reconnect_requested = daemon_requires_reconnect(
+                        current, updated, ipc.has_scope("messages.read")
+                    );
                     config = updated;
                     if (reconnect_requested) {
                         break;

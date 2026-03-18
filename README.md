@@ -29,6 +29,7 @@ Gamescope, X11 Vulkan apps, and X11/EGL OpenGL apps.
 - Shows the current Discord voice channel in-game
 - Updates speaking, mute, and deaf state live
 - Keeps active speakers visible when the channel is larger than the visible row limit
+- Can show the latest voice channel chat messages as fading overlay rows
 - Supports avatars, compact mode, and basic overlay placement controls
 - Runs as a daemon plus Vulkan/OpenGL hooks, with `sigaw-ctl` for control and status
 
@@ -39,18 +40,22 @@ with `meson compile -C build render-readme-screenshots`.
 
 <table>
   <tr>
-    <td width="33%">
+    <td width="25%">
       <img src="assets/screenshots/overlay-standard-detail.png" width="100%" alt="Standard Sigaw overlay with a channel header, speaker highlight, and inline mute and deaf icons." />
     </td>
-    <td width="33%">
+    <td width="25%">
+      <img src="assets/screenshots/overlay-chat-detail.png" width="100%" alt="Sigaw overlay showing the latest fading voice chat rows beneath the voice roster." />
+    </td>
+    <td width="25%">
       <img src="assets/screenshots/overlay-compact-detail.png" width="100%" alt="Compact Sigaw overlay with avatar-only rows, a speaking ring, and mute badges." />
     </td>
-    <td width="33%">
+    <td width="25%">
       <img src="assets/screenshots/overlay-overflow-detail.png" width="100%" alt="Sigaw overlay showing a larger voice channel collapsed into a plus more row." />
     </td>
   </tr>
   <tr>
     <td align="center"><strong>Standard layout</strong><br/>Channel header, live speaking state, and inline mute icons.</td>
+    <td align="center"><strong>Voice chat</strong><br/>Recent channel messages fade beneath the roster.</td>
     <td align="center"><strong>Compact mode</strong><br/>Avatar-first rows with badge indicators.</td>
     <td align="center"><strong>Larger channels</strong><br/>Extra users collapse into a <code>+N more</code> row.</td>
   </tr>
@@ -173,11 +178,16 @@ Sigaw keeps its config in `~/.config/sigaw/sigaw.conf`.
 | `opacity`           | `0.72`      | Overlay opacity from `0.0` to `1.0`                                    |
 | `show_avatars`      | `true`      | Show Discord avatars when available                                    |
 | `show_channel_name` | `false`     | Show a channel header above the user list                              |
+| `show_voice_channel_chat` | `false` | Show the latest voice channel chat messages below the user list         |
 | `compact`           | `false`     | Render a smaller avatar-first layout                                   |
 | `max_visible_users` | `8`         | Maximum rows shown before collapsing the rest into `+N more`           |
+| `max_visible_chat_messages` | `4`  | Maximum fading voice channel chat rows shown at once                   |
 | `visible`           | `true`      | Persisted overlay visibility, usually managed by `sigaw-ctl`           |
 
 Example config: [`sigaw.conf.example`](sigaw.conf.example).
+
+When `show_voice_channel_chat=true`, Sigaw will request Discord's `messages.read`
+scope the next time the daemon reconnects or reloads authentication.
 
 ## CLI
 

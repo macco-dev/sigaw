@@ -21,11 +21,17 @@ show_avatars=true
 # Show channel name header
 show_channel_name=false
 
+# Show the latest voice channel chat messages under the user list
+show_voice_channel_chat=false
+
 # Compact mode: small icons only, no usernames
 compact=false
 
 # Maximum users to display before truncating
 max_visible_users=8
+
+# Maximum voice channel chat messages to show before trimming older ones
+max_visible_chat_messages=4
 
 # Persisted overlay visibility (managed by sigaw-ctl)
 visible=true

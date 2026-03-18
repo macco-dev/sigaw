@@ -892,7 +892,9 @@ struct Ctx {
     std::unordered_map<VkImage, TargetView> target_views;
 
     sigaw::overlay::Runtime runtime;
+    bool             prefer_gpu_composite = std::getenv("SIGAW_GPU_COMPOSITE") != nullptr;
     bool             logged_first_render = false;
+    bool             logged_copy_path = false;
     bool             ok = false;
 };
 
@@ -1000,7 +1002,7 @@ static bool ensure_staging_capacity(Ctx& ctx, size_t bytes) {
     VkBufferCreateInfo bi = {};
     bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = ctx.ssz;
-    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (vkCreateBuffer(ctx.dev, &bi, nullptr, &ctx.sbuf) != VK_SUCCESS) {
         return false;
@@ -1403,9 +1405,96 @@ static Ctx::TargetView* ensure_target_view(Ctx& ctx, VkImage target_image,
 
 /* ---- Panel rendering ---- */
 
+static uint64_t monotonic_ms_now() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count()
+    );
+}
+
+static float chat_message_opacity(const SigawChatMessage& message, uint64_t now_ms) {
+    constexpr uint64_t hold_ms = 10000;
+    constexpr uint64_t fade_ms = 4000;
+    constexpr uint64_t total_lifetime_ms = hold_ms + fade_ms;
+
+    const uint64_t age = now_ms > message.observed_at_ms
+        ? now_ms - message.observed_at_ms
+        : 0u;
+    if (age >= total_lifetime_ms) {
+        return 0.0f;
+    }
+    if (age <= hold_ms) {
+        return 1.0f;
+    }
+
+    return std::clamp(
+        1.0f - static_cast<float>(age - hold_ms) / static_cast<float>(fade_ms),
+        0.0f,
+        1.0f
+    );
+}
+
+static std::vector<std::string>
+wrap_text_lines(TextSystem& text, FontRole role, int px,
+                std::string_view input, int max_width, int max_lines = 0)
+{
+    std::vector<std::string> lines;
+    if (input.empty() || max_width <= 0) {
+        return lines;
+    }
+
+    std::string current;
+    std::string word;
+    const auto flush_word = [&]() {
+        if (word.empty()) {
+            return;
+        }
+
+        if (current.empty()) {
+            current = word;
+            word.clear();
+            return;
+        }
+
+        const std::string candidate = current + " " + word;
+        if (text.measure(role, px, candidate) <= max_width) {
+            current = candidate;
+        } else {
+            lines.push_back(current);
+            current = word;
+        }
+        word.clear();
+    };
+
+    for (char ch : input) {
+        if (ch == ' ') {
+            flush_word();
+            continue;
+        }
+        word.push_back(ch);
+    }
+    flush_word();
+    if (!current.empty()) {
+        lines.push_back(current);
+    }
+
+    if (max_lines > 0 && static_cast<int>(lines.size()) > max_lines) {
+        std::string tail = lines[max_lines - 1];
+        for (size_t i = static_cast<size_t>(max_lines); i < lines.size(); ++i) {
+            tail += " " + lines[i];
+        }
+        lines.resize(static_cast<size_t>(max_lines));
+        lines.back() = std::move(tail);
+    }
+
+    return lines;
+}
+
 static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
                         PBuf& pb, TextSystem& text, AvatarStore& avatars,
-                        const std::unordered_map<uint64_t, float>& speaking_times_ms)
+                        const std::unordered_map<uint64_t, float>& speaking_times_ms,
+                        uint64_t now_ms)
 {
     if (!text.ready()) {
         pb.init(0, 0);
@@ -1426,6 +1515,8 @@ static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
 
     const auto name_metrics = text.metrics(FontRole::Semibold, m.name_font_px);
     const auto header_metrics = text.metrics(FontRole::Regular, m.header_font_px);
+    const auto chat_metrics = text.metrics(FontRole::Regular, m.chat_font_px);
+    const auto chat_author_metrics = text.metrics(FontRole::Semibold, m.chat_font_px);
     const auto mono_metrics = text.metrics(FontRole::Semibold, m.monogram_font_px);
     const int header_w = show_header
         ? sigaw::overlay::header_width_for_text(
@@ -1486,18 +1577,89 @@ static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
         pill_column_w = std::max(pill_column_w, more_w);
     }
 
+    struct ChatRow {
+        const SigawChatMessage* message = nullptr;
+        float opacity = 0.0f;
+        int width = 0;
+        int height = 0;
+        std::vector<std::string> content_lines;
+    };
+
+    std::vector<ChatRow> chat_rows;
+    if (cfg.show_voice_channel_chat && cfg.max_visible_chat_messages > 0 && vs.chat_count > 0) {
+        const uint32_t visible_chat = std::min(
+            static_cast<uint32_t>(cfg.max_visible_chat_messages),
+            std::min(vs.chat_count, static_cast<uint32_t>(SIGAW_MAX_CHAT_MESSAGES))
+        );
+        const uint32_t start = vs.chat_count > visible_chat ? vs.chat_count - visible_chat : 0;
+        const int chat_block_w = std::max(pill_column_w + avatar_column_w, m.chat_max_text_width);
+        const int chat_text_w = std::max(0, chat_block_w - m.chat_pad_x * 2);
+        constexpr int max_chat_lines = 3;
+
+        for (uint32_t i = start; i < vs.chat_count; ++i) {
+            const auto& message = vs.chat_messages[i];
+            if (message.author_name_len == 0 || message.content_len == 0) {
+                continue;
+            }
+
+            const float opacity = chat_message_opacity(message, now_ms);
+            if (opacity <= 0.0f) {
+                continue;
+            }
+
+            const std::string_view author(message.author_name, message.author_name_len);
+            const std::string_view content(message.content, message.content_len);
+            auto content_lines = wrap_text_lines(
+                text, FontRole::Regular, m.chat_font_px, content, chat_text_w, max_chat_lines
+            );
+            const int body_lines_h =
+                static_cast<int>(content_lines.size()) * chat_metrics.height +
+                std::max(0, static_cast<int>(content_lines.size()) - 1) * m.chat_line_gap;
+            const int text_h = chat_author_metrics.height +
+                (content_lines.empty() ? 0 : (m.chat_line_gap + body_lines_h));
+            const int row_h = std::max(
+                m.chat_row_height,
+                text_h + m.chat_pad_y * 2
+            );
+            chat_rows.push_back(ChatRow{
+                &message,
+                opacity,
+                chat_block_w,
+                row_h,
+                std::move(content_lines)
+            });
+        }
+    }
+
     const int header_h = show_header ? (m.header_height + m.header_gap) : 0;
     const int row_count = static_cast<int>(visible);
     const int rows_h = row_count * m.row_height + std::max(0, row_count - 1) * m.row_gap;
     const int more_h = more_label.empty() ? 0 : (m.row_gap + m.row_height);
-    const int panel_content_w = pill_column_w + avatar_column_w;
+    int chat_block_w = 0;
+    int chat_rows_h = 0;
+    for (size_t i = 0; i < chat_rows.size(); ++i) {
+        chat_block_w = std::max(chat_block_w, chat_rows[i].width);
+        chat_rows_h += chat_rows[i].height;
+        if (i + 1 < chat_rows.size()) {
+            chat_rows_h += m.chat_row_gap;
+        }
+    }
+    const int chat_h = chat_rows.empty() ? 0 : (m.chat_stack_gap + chat_rows_h);
+    const int roster_content_w = pill_column_w + avatar_column_w;
+    const int panel_content_w = std::max(roster_content_w, chat_block_w);
+    const bool align_right =
+        cfg.position == sigaw::OverlayPosition::TopRight ||
+        cfg.position == sigaw::OverlayPosition::BottomRight;
+    const int roster_origin_x = m.outer_pad + (align_right ? panel_content_w - roster_content_w : 0);
+    const int chat_origin_x = m.outer_pad + (align_right ? panel_content_w - chat_block_w : 0);
     const uint32_t panel_w = static_cast<uint32_t>(m.outer_pad * 2 + std::max(panel_content_w, m.row_height));
-    const uint32_t panel_h = static_cast<uint32_t>(m.outer_pad * 2 + header_h + rows_h + more_h);
+    const uint32_t panel_h = static_cast<uint32_t>(m.outer_pad * 2 + header_h + rows_h + more_h + chat_h);
     pb.init(panel_w, panel_h);
 
     const RGBA bubble_bg = apply_opacity(mk(24, 24, 27, 246), cfg.opacity);
     const RGBA bubble_spk = apply_opacity(mk(32, 33, 37, 250), std::clamp(cfg.opacity + 0.04f, 0.0f, 1.0f));
     const RGBA bubble_muted = apply_opacity(mk(26, 26, 30, 248), cfg.opacity);
+    const RGBA chat_bg = apply_opacity(mk(21, 22, 26, 234), cfg.opacity);
     const RGBA header_bg = apply_opacity(mk(24, 26, 30, 232), cfg.opacity);
     const RGBA base_text = mk(255, 255, 255, 255);
     const RGBA fg = apply_opacity(base_text, std::clamp(cfg.opacity + 0.08f, 0.0f, 1.0f));
@@ -1510,6 +1672,8 @@ static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
     const RGBA muted_text = apply_opacity(mix_rgba(base_text, mk(168, 173, 182, 255), 0.68f), cfg.opacity);
     const RGBA status_icon = apply_opacity(mix_rgba(muted_text, muted, 0.14f),
                                            std::clamp(cfg.opacity + 0.04f, 0.0f, 1.0f));
+    const RGBA chat_author = apply_opacity(base_text, std::clamp(cfg.opacity + 0.10f, 0.0f, 1.0f));
+    const RGBA chat_body = apply_opacity(mix_rgba(base_text, mk(196, 200, 208, 255), 0.30f), cfg.opacity);
 
     auto centered_baseline = [](int box_y, int box_h, const FontFaceCache::Metrics& metrics) {
         return box_y + (box_h - metrics.height) / 2 + metrics.ascender;
@@ -1581,7 +1745,7 @@ static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
 
     int y = m.outer_pad;
     if (show_header) {
-        const int header_x = m.outer_pad + pill_column_w - header_w;
+        const int header_x = roster_origin_x + pill_column_w - header_w;
         pb.rrect(header_x + m.shadow_offset, y + m.shadow_offset,
                  header_w, m.header_height, m.header_radius, shadow);
         pb.rrect(header_x, y, header_w, m.header_height, m.header_radius, header_bg);
@@ -1593,7 +1757,7 @@ static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
     }
 
     auto draw_row = [&](const SigawUser* user, std::string_view label, int pill_w, bool active_bg, int row_y) {
-        const int row_x = m.outer_pad + pill_column_w - pill_w;
+        const int row_x = roster_origin_x + pill_column_w - pill_w;
         const auto row = user ? user_row_layout(row_x, row_y, pill_w)
                               : sigaw::overlay::layout_row(row_x, row_y, pill_w, m);
         const int icons = (!cfg.compact && user) ? status_icon_count(*user) : 0;
@@ -1625,7 +1789,7 @@ static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
     if (!more_label.empty()) {
         const int row_y = y + static_cast<int>(visible) * (m.row_height + m.row_gap);
         const int more_w = pill_widths.back();
-        const int row_x = m.outer_pad + pill_column_w - more_w;
+        const int row_x = roster_origin_x + pill_column_w - more_w;
         const auto row = sigaw::overlay::layout_row(row_x, row_y, more_w, m);
         if (m.shadow_offset > 0 && shadow.a > 0) {
             pb.rrect(row.pill_x + m.shadow_offset, row.pill_y + m.shadow_offset,
@@ -1636,6 +1800,57 @@ static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
                   row.pill_x + m.pill_pad_x,
                   centered_baseline(row.pill_y, row.pill_h, header_metrics),
                   more_label, dim, sigaw::overlay::text_max_width_for_pill(row.pill_w, m));
+    }
+
+    if (!chat_rows.empty()) {
+        int chat_y = y + rows_h + more_h + m.chat_stack_gap;
+
+        for (const auto& row : chat_rows) {
+            const int row_x = chat_origin_x;
+            const int row_w = row.width;
+            const RGBA row_shadow = apply_opacity(shadow, row.opacity);
+            const RGBA row_bg = apply_opacity(chat_bg, row.opacity);
+            const RGBA row_author = apply_opacity(chat_author, row.opacity);
+            const RGBA row_body = apply_opacity(chat_body, row.opacity);
+            if (m.shadow_offset > 0 && row_shadow.a > 0) {
+                pb.rrect(row_x + m.shadow_offset, chat_y + m.shadow_offset,
+                         row_w, row.height, m.chat_radius, row_shadow);
+            }
+            pb.rrect(row_x, chat_y, row_w, row.height, m.chat_radius, row_bg);
+
+            const auto& message = *row.message;
+            const std::string_view author(message.author_name, message.author_name_len);
+            const int available_w = std::max(0, row_w - m.chat_pad_x * 2);
+            int text_y = chat_y + m.chat_pad_y;
+            const int author_baseline = text_y + chat_author_metrics.ascender;
+            text.draw(
+                pb,
+                FontRole::Semibold,
+                m.chat_font_px,
+                row_x + m.chat_pad_x,
+                author_baseline,
+                author,
+                row_author,
+                available_w
+            );
+
+            text_y += chat_author_metrics.height + m.chat_line_gap;
+            for (const auto& line : row.content_lines) {
+                text.draw(
+                    pb,
+                    FontRole::Regular,
+                    m.chat_font_px,
+                    row_x + m.chat_pad_x,
+                    text_y + chat_metrics.ascender,
+                    line,
+                    row_body,
+                    available_w
+                );
+                text_y += chat_metrics.height + m.chat_line_gap;
+            }
+
+            chat_y += row.height + m.chat_row_gap;
+        }
     }
 }
 
@@ -1686,7 +1901,8 @@ static sigaw::preview::Placement panel_placement(const sigaw::Config& cfg,
 
 static bool render_panel_rgba_internal(const SigawState& state, const sigaw::Config& cfg,
                                        const std::unordered_map<uint64_t, float>& speaking_times_ms,
-                                       sigaw::preview::Image& out)
+                                       sigaw::preview::Image& out,
+                                       uint64_t now_ms)
 {
     if (!cfg.visible) {
         out = {};
@@ -1696,7 +1912,15 @@ static bool render_panel_rgba_internal(const SigawState& state, const sigaw::Con
     TextSystem text;
     AvatarStore avatars;
     PBuf panel;
-    build_panel(state, cfg, panel, text, avatars, speaking_times_ms);
+    build_panel(
+        state,
+        cfg,
+        panel,
+        text,
+        avatars,
+        speaking_times_ms,
+        now_ms != 0 ? now_ms : monotonic_ms_now()
+    );
     if (panel.p.empty() || panel.w == 0 || panel.h == 0) {
         out = {};
         return false;
@@ -1745,9 +1969,10 @@ namespace sigaw::preview {
 
 bool render_panel_rgba(const SigawState& state, const sigaw::Config& cfg,
                        const std::unordered_map<uint64_t, float>& speaking_times_ms,
-                       Image& out)
+                       Image& out,
+                       uint64_t now_ms)
 {
-    return render_panel_rgba_internal(state, cfg, speaking_times_ms, out);
+    return render_panel_rgba_internal(state, cfg, speaking_times_ms, out, now_ms);
 }
 
 Placement place_panel(const sigaw::Config& cfg, uint32_t panel_w, uint32_t panel_h,
@@ -1825,6 +2050,145 @@ bool Runtime::debug_enabled() const {
 }
 
 } /* namespace sigaw::overlay */
+
+static void composite_frame_over(void* dst, VkFormat fmt,
+                                 const sigaw::overlay::PreparedFrame& frame)
+{
+    auto* out = static_cast<uint8_t*>(dst);
+    for (uint32_t y = 0; y < frame.height; ++y) {
+        for (uint32_t x = 0; x < frame.width; ++x) {
+            const size_t idx = (static_cast<size_t>(y) * frame.width + x) * 4u;
+            const RGBA src = {
+                frame.rgba[idx + 0],
+                frame.rgba[idx + 1],
+                frame.rgba[idx + 2],
+                frame.rgba[idx + 3],
+            };
+            if (src.a == 0) {
+                continue;
+            }
+
+            uint8_t* px = out + idx;
+            const RGBA dst_px = PBuf::load_pixel(px, fmt);
+            PBuf::store_pixel(px, fmt, alpha_blend(dst_px, src));
+        }
+    }
+}
+
+static int render_overlay_copy(Ctx& c, VkQueue queue, VkImage target_image, VkFormat format,
+                               const sigaw::overlay::PreparedFrame& frame,
+                               int px, int py,
+                               uint32_t wait_sem_count, const VkSemaphore* wait_sems,
+                               VkSemaphore signal_sem)
+{
+    const uint32_t cw = frame.width;
+    const uint32_t ch = frame.height;
+    const size_t bytes = frame.byte_size;
+
+    if (!ensure_staging_capacity(c, bytes) || bytes > static_cast<size_t>(c.ssz)) {
+        return 0;
+    }
+
+    vkWaitForFences(c.dev, 1, &c.fen, VK_TRUE, UINT64_MAX);
+    vkResetFences(c.dev, 1, &c.fen);
+    vkResetCommandBuffer(c.cmd, 0);
+
+    VkCommandBufferBeginInfo beg = {};
+    beg.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beg.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(c.cmd, &beg);
+
+    VkImageMemoryBarrier bar = {};
+    bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    bar.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.image = target_image;
+    bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &bar);
+
+    VkBufferImageCopy reg = {};
+    reg.bufferRowLength = cw;
+    reg.bufferImageHeight = ch;
+    reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    reg.imageOffset = {px, py, 0};
+    reg.imageExtent = {cw, ch, 1};
+    vkCmdCopyImageToBuffer(c.cmd, target_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c.sbuf, 1, &reg);
+
+    vkEndCommandBuffer(c.cmd);
+
+    VkSubmitInfo sub = {};
+    sub.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    sub.commandBufferCount = 1;
+    sub.pCommandBuffers = &c.cmd;
+    VkPipelineStageFlags wait_stages[8] = {};
+    if (wait_sem_count > 8) {
+        wait_sem_count = 8;
+    }
+    for (uint32_t i = 0; i < wait_sem_count; ++i) {
+        wait_stages[i] = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    }
+    if (wait_sem_count != 0 && wait_sems != nullptr) {
+        sub.waitSemaphoreCount = wait_sem_count;
+        sub.pWaitSemaphores = wait_sems;
+        sub.pWaitDstStageMask = wait_stages;
+    }
+    if (vkQueueSubmit(queue, 1, &sub, c.fen) != VK_SUCCESS) {
+        return 0;
+    }
+
+    vkWaitForFences(c.dev, 1, &c.fen, VK_TRUE, UINT64_MAX);
+    composite_frame_over(c.sptr, format, frame);
+
+    vkResetFences(c.dev, 1, &c.fen);
+    vkResetCommandBuffer(c.cmd, 0);
+    vkBeginCommandBuffer(c.cmd, &beg);
+
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &bar);
+
+    vkCmdCopyBufferToImage(c.cmd, c.sbuf, target_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bar.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bar.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &bar);
+
+    vkEndCommandBuffer(c.cmd);
+
+    sub.waitSemaphoreCount = 0;
+    sub.pWaitSemaphores = nullptr;
+    sub.pWaitDstStageMask = nullptr;
+    if (signal_sem != VK_NULL_HANDLE) {
+        sub.signalSemaphoreCount = 1;
+        sub.pSignalSemaphores = &signal_sem;
+    } else {
+        sub.signalSemaphoreCount = 0;
+        sub.pSignalSemaphores = nullptr;
+    }
+    if (vkQueueSubmit(queue, 1, &sub, c.fen) != VK_SUCCESS) {
+        return 0;
+    }
+    if (signal_sem == VK_NULL_HANDLE) {
+        vkWaitForFences(c.dev, 1, &c.fen, VK_TRUE, UINT64_MAX);
+    }
+    return 1;
+}
 
 /* ======================================================================== */
 /*  C API                                                                    */
@@ -1940,7 +2304,7 @@ SigawOverlayContext* sigaw_overlay_create(VkDevice device, VkPhysicalDevice phys
     }
 
     if (!ensure_staging_capacity(c, 2 * 1024 * 1024) ||
-        !ensure_descriptor_resources(c)) {
+        (c.prefer_gpu_composite && !ensure_descriptor_resources(c))) {
         destroy_overlay_context(ctx, false);
         delete ctx;
         return nullptr;
@@ -2012,6 +2376,25 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
     const uint32_t cw = frame.width;
     const uint32_t ch = frame.height;
     const size_t bytes = frame.byte_size;
+
+    if (c.runtime.debug_enabled() && !c.logged_first_render) {
+        fprintf(stderr,
+                "[sigaw] Debug: first render submit panel=%ux%u fmt=%d target=%ux%u at=%d,%d\n",
+                cw, ch, format, width, height, px, py);
+        c.logged_first_render = true;
+    }
+
+    if (!c.prefer_gpu_composite) {
+        if (c.runtime.debug_enabled() && !c.logged_copy_path) {
+            fprintf(stderr,
+                    "[sigaw] Debug: using safe Vulkan transfer composite path; set SIGAW_GPU_COMPOSITE=1 to opt into the quad path\n");
+            c.logged_copy_path = true;
+        }
+        return render_overlay_copy(
+            c, queue, target_image, format, frame, px, py, wait_sem_count, wait_sems, signal_sem
+        );
+    }
+
     const bool needs_upload =
         frame.changed ||
         c.uploaded_sequence != frame.sequence ||
@@ -2033,13 +2416,6 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
     auto* target = ensure_target_view(c, target_image, format, width, height);
     if (target == nullptr) {
         return 0;
-    }
-
-    if (c.runtime.debug_enabled() && !c.logged_first_render) {
-        fprintf(stderr,
-                "[sigaw] Debug: first render submit panel=%ux%u fmt=%d target=%ux%u at=%d,%d\n",
-                cw, ch, format, width, height, px, py);
-        c.logged_first_render = true;
     }
 
     vkWaitForFences(c.dev, 1, &c.fen, VK_TRUE, UINT64_MAX);

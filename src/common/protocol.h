@@ -15,8 +15,11 @@ extern "C" {
 
 #define SIGAW_MAGIC        0x53494741  /* "SIGA" */
 #define SIGAW_OVERLAY_MAGIC 0x5349474f /* "SIGO" */
-#define SIGAW_VERSION      3
+#define SIGAW_VERSION      4
 #define SIGAW_MAX_USERS    64
+#define SIGAW_MAX_CHAT_MESSAGES 8
+#define SIGAW_MAX_CHAT_AUTHOR   48
+#define SIGAW_MAX_CHAT_CONTENT  160
 #define SIGAW_SHM_SIZE     sizeof(struct SigawState)
 
 /* Socket path for daemon <-> ctl communication */
@@ -60,14 +63,33 @@ struct __attribute__((aligned(128))) SigawUser {
 SIGAW_STATIC_ASSERT(sizeof(struct SigawUser) == 128, "SigawUser must be 128 bytes");
 
 /*
+ * Per-message voice channel chat entry: 256 bytes each.
+ * Timestamps use daemon steady-clock milliseconds so fade timing is monotonic.
+ */
+struct __attribute__((aligned(64))) SigawChatMessage {
+    uint64_t message_id;
+    uint64_t author_id;
+    uint64_t observed_at_ms;
+    uint32_t author_name_len;
+    uint32_t content_len;
+    char     author_name[SIGAW_MAX_CHAT_AUTHOR];
+    char     content[SIGAW_MAX_CHAT_CONTENT];
+    uint8_t  _pad[16];
+};
+
+SIGAW_STATIC_ASSERT(sizeof(struct SigawChatMessage) == 256,
+                    "SigawChatMessage must be 256 bytes");
+
+/*
  * Full voice channel state.
- * Total size: 64 + 8 + (128 * 64) = 8264 bytes -- fits in 3 pages.
+ * Total size: 64 + 8 + (128 * 64) + (256 * 8) = 10312 bytes.
  */
 struct SigawState {
     struct SigawHeader header;
     uint32_t user_count;          /* Number of valid entries in users[] */
-    uint32_t _pad;
+    uint32_t chat_count;          /* Number of valid entries in chat_messages[] */
     struct SigawUser users[SIGAW_MAX_USERS];
+    struct SigawChatMessage chat_messages[SIGAW_MAX_CHAT_MESSAGES];
 };
 
 enum SigawOverlayAnchor {

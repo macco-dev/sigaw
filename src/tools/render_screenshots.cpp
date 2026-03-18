@@ -46,6 +46,14 @@ struct SceneUser {
     bool server_deaf = false;
 };
 
+struct SceneChatMessage {
+    uint64_t message_id = 0;
+    uint64_t author_id = 0;
+    uint64_t observed_at_ms = 0;
+    std::string author_name;
+    std::string content;
+};
+
 enum class BackgroundStyle {
     Ember,
     Verdant,
@@ -58,6 +66,8 @@ struct Scene {
     sigaw::Config config;
     BackgroundStyle background = BackgroundStyle::Ember;
     std::vector<SceneUser> users;
+    std::vector<SceneChatMessage> chat_messages;
+    uint64_t preview_now_ms = 10'000;
 };
 
 struct Rect {
@@ -392,6 +402,25 @@ SigawState build_state(const Scene& scene) {
         dst.server_mute = user.server_mute ? 1 : 0;
         dst.server_deaf = user.server_deaf ? 1 : 0;
     }
+
+    state.chat_count = static_cast<uint32_t>(
+        std::min<size_t>(scene.chat_messages.size(), SIGAW_MAX_CHAT_MESSAGES)
+    );
+    for (uint32_t i = 0; i < state.chat_count; ++i) {
+        const auto& message = scene.chat_messages[i];
+        auto& dst = state.chat_messages[i];
+        dst.message_id = message.message_id;
+        dst.author_id = message.author_id;
+        dst.observed_at_ms = message.observed_at_ms;
+        copy_truncated(dst.author_name, sizeof(dst.author_name), message.author_name);
+        dst.author_name_len = static_cast<uint32_t>(
+            std::char_traits<char>::length(dst.author_name)
+        );
+        copy_truncated(dst.content, sizeof(dst.content), message.content);
+        dst.content_len = static_cast<uint32_t>(
+            std::char_traits<char>::length(dst.content)
+        );
+    }
     return state;
 }
 
@@ -454,6 +483,33 @@ std::vector<Scene> build_scenes() {
         {110, "Noah", "noah", false, false, false, false, false},
     };
     scenes.push_back(std::move(standard));
+
+    Scene chat;
+    chat.detail_filename = "overlay-chat-detail.png";
+    chat.channel_name = "squad comms";
+    chat.background = BackgroundStyle::Ember;
+    chat.config.position = sigaw::OverlayPosition::TopRight;
+    chat.config.scale = 2.35f;
+    chat.config.opacity = 0.82f;
+    chat.config.show_avatars = true;
+    chat.config.show_channel = true;
+    chat.config.show_voice_channel_chat = true;
+    chat.config.compact = false;
+    chat.config.max_visible = 4;
+    chat.config.max_visible_chat_messages = 2;
+    chat.users = {
+        {101, "Alex", "alex", true, false, false, false, false},
+        {102, "Morgan", "morgan", false, true, true, false, false},
+        {103, "Priya", "priya", false, false, false, false, false},
+        {104, "Devon", "devon", false, false, false, false, false},
+        {105, "Sara", "sara", false, false, false, false, false},
+        {110, "Noah", "noah", false, false, false, false, false},
+    };
+    chat.chat_messages = {
+        {401, 102, chat.preview_now_ms, "Morgan", "Breach on the left, I can't type fast enough"},
+        {402, 103, chat.preview_now_ms, "Priya", "Copy that, covering the stairs"},
+    };
+    scenes.push_back(std::move(chat));
 
     Scene compact;
     compact.detail_filename = "overlay-compact-detail.png";
@@ -595,7 +651,9 @@ int main(int argc, char** argv) {
             }
 
             Image panel;
-            if (!sigaw::preview::render_panel_rgba(state, scene.config, speaking_times_ms, panel)) {
+            if (!sigaw::preview::render_panel_rgba(
+                    state, scene.config, speaking_times_ms, panel, scene.preview_now_ms
+                )) {
                 std::cerr << "failed to render overlay panel for " << scene.detail_filename << "\n";
                 ok = false;
                 break;

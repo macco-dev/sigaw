@@ -36,6 +36,9 @@ struct PendingVoiceSync {
 struct VoiceRuntimeState {
     VoiceState voice;
     std::string subscribed_channel_id;
+    std::string active_chat_channel_id;
+    std::string subscribed_chat_channel_id;
+    bool live_chat_events = false;
     PendingVoiceSync pending_sync;
 };
 

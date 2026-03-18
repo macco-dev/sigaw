@@ -377,6 +377,17 @@ test(
   config_watcher_test,
 )
 
+config_parse_test = executable(
+  'sigaw-config-parse-test',
+  'tests/config_parse_test.cpp',
+  include_directories: include_directories('src'),
+)
+
+test(
+  'sigaw-config-parse',
+  config_parse_test,
+)
+
 shm_reader_test = executable(
   'sigaw-shm-reader-test',
   'tests/shm_reader_test.cpp',

@@ -39,6 +39,8 @@ void write_voice(sigaw::ShmWriter& writer,
     writer.set_channel(channel_name);
     writer.set_user_count(1);
     writer.set_user(0, user_id, username, "", false, false, false, false, false);
+    writer.set_chat_count(1);
+    writer.set_chat_message(0, 55, 77, 9'999, "Bravo", "Need backup");
     writer.end_write();
 }
 
@@ -80,7 +82,10 @@ bool test_reader_disconnects_and_remaps_after_writer_restart() {
     }
     if (std::string(initial.header.channel_name) != "Lobby" ||
         initial.user_count != 1 ||
-        std::string(initial.users[0].username) != "Alpha") {
+        std::string(initial.users[0].username) != "Alpha" ||
+        initial.chat_count != 1 ||
+        std::string(initial.chat_messages[0].author_name) != "Bravo" ||
+        std::string(initial.chat_messages[0].content) != "Need backup") {
         std::cerr << "initial SHM snapshot mismatch\n";
         return false;
     }
@@ -111,7 +116,9 @@ bool test_reader_disconnects_and_remaps_after_writer_restart() {
     }
     if (std::string(restarted.header.channel_name) != "General" ||
         restarted.user_count != 1 ||
-        std::string(restarted.users[0].username) != "Bravo") {
+        std::string(restarted.users[0].username) != "Bravo" ||
+        restarted.chat_count != 1 ||
+        std::string(restarted.chat_messages[0].content) != "Need backup") {
         std::cerr << "reader did not pick up restarted SHM contents\n";
         return false;
     }

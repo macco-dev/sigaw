@@ -138,6 +138,14 @@ static int cmd_status() {
 
             printf("  %s%s\n", u->username, status);
         }
+
+        if (state->chat_count > 0) {
+            printf("Recent chat (%u):\n", state->chat_count);
+            for (uint32_t i = 0; i < state->chat_count; ++i) {
+                const SigawChatMessage* message = &state->chat_messages[i];
+                printf("  %s: %s\n", message->author_name, message->content);
+            }
+        }
     } else {
         printf("Voice channel: none\n");
     }

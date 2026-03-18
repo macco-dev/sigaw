@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <fstream>
 #include <filesystem>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -38,11 +39,20 @@ struct VoiceUser {
     bool server_deaf = false;
 };
 
+struct VoiceChatMessage {
+    uint64_t    id = 0;
+    uint64_t    author_id = 0;
+    uint64_t    observed_at_ms = 0;
+    std::string author_name;
+    std::string content;
+};
+
 struct VoiceState {
     std::string            channel_id;
     std::string            channel_name;
     std::string            guild_id;
     std::vector<VoiceUser> users;
+    std::vector<VoiceChatMessage> chat_messages;
 };
 
 struct DiscordUserIdentity {
@@ -173,7 +183,8 @@ public:
 
     void disconnect() {
         if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
-        connected_ = authed_ = false;
+        connected_ = false;
+        clear_auth_state();
         inbox_ = {};
     }
 
@@ -203,21 +214,33 @@ public:
      * 1) Check for cached token -- if valid, use it directly.
      * 2) Otherwise: AUTHORIZE -> exchange code -> AUTHENTICATE.
      */
-    bool authorize(const std::string& secret) {
+    bool authorize(const std::string& secret, bool require_messages_read = false) {
         /* Try cached token first */
         std::string token = load_token();
         if (!token.empty()) {
-            if (authenticate(token)) return true;
-            fprintf(stderr, "[sigaw] Cached token expired, re-authorizing\n");
+            if (authenticate(token) && scope_satisfied(require_messages_read)) {
+                return true;
+            }
+
+            if (authed_ && !scope_satisfied(require_messages_read)) {
+                fprintf(stderr, "[sigaw] Cached token missing messages.read scope, re-authorizing\n");
+            } else {
+                fprintf(stderr, "[sigaw] Cached token expired, re-authorizing\n");
+            }
+            clear_auth_state();
         }
 
         /* Send AUTHORIZE request -- Discord shows popup to user */
+        json scopes = json::array({"rpc", "rpc.voice.read"});
+        if (require_messages_read) {
+            scopes.push_back("messages.read");
+        }
         json req = {
             {"cmd", "AUTHORIZE"},
             {"nonce", nonce()},
             {"args", {
                 {"client_id", client_id_},
-                {"scopes", {"rpc", "rpc.voice.read"}},
+                {"scopes", scopes},
             }}
         };
         json j;
@@ -240,7 +263,17 @@ public:
         }
 
         save_token(token);
-        return authenticate(token);
+        if (!authenticate(token)) {
+            return false;
+        }
+
+        if (!scope_satisfied(require_messages_read)) {
+            fprintf(stderr, "[sigaw] Authenticated token missing required scopes\n");
+            clear_auth_state();
+            return false;
+        }
+
+        return true;
     }
 
     /* Subscribe to VOICE_CHANNEL_SELECT (global). */
@@ -266,6 +299,20 @@ public:
                unsub("VOICE_STATE_DELETE", args) &&
                unsub("SPEAKING_START", args) &&
                unsub("SPEAKING_STOP", args);
+    }
+
+    bool subscribe_channel_messages(const std::string& ch_id) {
+        json args = {{"channel_id", ch_id}};
+        return sub("MESSAGE_CREATE", args) &&
+               sub("MESSAGE_UPDATE", args) &&
+               sub("MESSAGE_DELETE", args);
+    }
+
+    bool unsubscribe_channel_messages(const std::string& ch_id) {
+        json args = {{"channel_id", ch_id}};
+        return unsub("MESSAGE_CREATE", args) &&
+               unsub("MESSAGE_UPDATE", args) &&
+               unsub("MESSAGE_DELETE", args);
     }
 
     /* Get current voice channel state (blocking RPC call). */
@@ -306,6 +353,58 @@ public:
             }
         }
         return vs;
+    }
+
+    bool get_channel_messages(const std::string& channel_id, size_t limit, json& messages) {
+        messages = json::array();
+        if (!authed_ || access_token_.empty() || channel_id.empty()) {
+            return false;
+        }
+
+        const size_t clamped_limit = std::clamp<size_t>(limit, 1u, 100u);
+        CURL* curl = curl_easy_init();
+        if (!curl) {
+            return false;
+        }
+
+        std::string response;
+        const std::string url =
+            "https://discord.com/api/v10/channels/" + channel_id +
+            "/messages?limit=" + std::to_string(clamped_limit);
+        const std::string auth_header = "Authorization: Bearer " + access_token_;
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, auth_header.c_str());
+        headers = curl_slist_append(headers, "Accept: application/json");
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+
+        const CURLcode res = curl_easy_perform(curl);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        if (res != CURLE_OK) {
+            fprintf(stderr, "[sigaw] curl error: %s\n", curl_easy_strerror(res));
+            return false;
+        }
+        if (status < 200 || status >= 300) {
+            fprintf(stderr, "[sigaw] Message history request failed: HTTP %ld\n", status);
+            return false;
+        }
+
+        auto parsed = json::parse(response, nullptr, false);
+        if (parsed.is_discarded() || !parsed.is_array()) {
+            fprintf(stderr, "[sigaw] Invalid message history response\n");
+            return false;
+        }
+
+        messages = std::move(parsed);
+        return true;
     }
 
     /* Non-blocking event poll. Returns empty json if nothing pending. */
@@ -353,6 +452,9 @@ public:
     int fd() const { return fd_; }
     bool is_connected()    const { return connected_; }
     bool is_authenticated() const { return authed_; }
+    bool has_scope(std::string_view scope) const {
+        return std::find(scopes_.begin(), scopes_.end(), scope) != scopes_.end();
+    }
     const DiscordUserIdentity& local_user() const { return inbox_.local_user(); }
 
 private:
@@ -361,6 +463,18 @@ private:
     bool connected_ = false, authed_ = false;
     uint64_t nonce_ctr_ = 0;
     DiscordMessageInbox inbox_;
+    std::string access_token_;
+    std::vector<std::string> scopes_;
+
+    void clear_auth_state() {
+        authed_ = false;
+        access_token_.clear();
+        scopes_.clear();
+    }
+
+    bool scope_satisfied(bool require_messages_read) const {
+        return !require_messages_read || has_scope("messages.read");
+    }
 
     bool try_sock(const std::string& path) {
         int s = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -497,6 +611,7 @@ private:
     }
 
     bool authenticate(const std::string& token) {
+        clear_auth_state();
         json req = {
             {"cmd", "AUTHENTICATE"},
             {"nonce", nonce()},
@@ -506,6 +621,18 @@ private:
         if (!send_request(req, j)) return false;
         if (j.is_discarded()) return false;
         if (json_utils::string_or(j, "cmd") == "AUTHENTICATE" && j.contains("data")) {
+            if (const auto* data = json_utils::object_or_null(j, "data")) {
+                const auto it = data->find("scopes");
+                if (it != data->end() && it->is_array()) {
+                    for (const auto& scope : *it) {
+                        const auto scope_name = json_utils::string_value(scope);
+                        if (!scope_name.empty()) {
+                            scopes_.push_back(scope_name);
+                        }
+                    }
+                }
+            }
+            access_token_ = token;
             authed_ = true;
             fprintf(stderr, "[sigaw] Authenticated\n");
             return true;

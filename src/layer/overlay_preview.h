@@ -24,7 +24,7 @@ struct Placement {
 
 bool render_panel_rgba(const SigawState& state, const sigaw::Config& cfg,
                        const std::unordered_map<uint64_t, float>& speaking_times_ms,
-                       Image& out);
+                       Image& out, uint64_t now_ms = 0);
 
 Placement place_panel(const sigaw::Config& cfg, uint32_t panel_w, uint32_t panel_h,
                       uint32_t screen_w, uint32_t screen_h);

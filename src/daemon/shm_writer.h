@@ -120,11 +120,24 @@ public:
         state_->header.channel_name[0] = '\0';
         state_->header.channel_name_len = 0;
         state_->user_count = 0;
+        clear_chat();
     }
 
     void set_user_count(uint32_t count) {
         if (!state_) return;
         state_->user_count = (count > SIGAW_MAX_USERS) ? SIGAW_MAX_USERS : count;
+    }
+
+    void clear_chat() {
+        if (!state_) return;
+        state_->chat_count = 0;
+        std::memset(state_->chat_messages, 0, sizeof(state_->chat_messages));
+    }
+
+    void set_chat_count(uint32_t count) {
+        if (!state_) return;
+        state_->chat_count =
+            (count > SIGAW_MAX_CHAT_MESSAGES) ? SIGAW_MAX_CHAT_MESSAGES : count;
     }
 
     SigawUser* get_user(uint32_t index) {
@@ -154,6 +167,38 @@ public:
         u->server_mute = server_mute ? 1 : 0;
         u->server_deaf = server_deaf ? 1 : 0;
         u->suppress    = 0;
+    }
+
+    void set_chat_message(uint32_t index,
+                          uint64_t message_id,
+                          uint64_t author_id,
+                          uint64_t observed_at_ms,
+                          const char* author_name,
+                          const char* content)
+    {
+        if (!state_ || index >= SIGAW_MAX_CHAT_MESSAGES) return;
+
+        SigawChatMessage* message = &state_->chat_messages[index];
+        std::memset(message, 0, sizeof(*message));
+        message->message_id = message_id;
+        message->author_id = author_id;
+        message->observed_at_ms = observed_at_ms;
+
+        size_t author_len = std::strlen(author_name);
+        if (author_len >= sizeof(message->author_name)) {
+            author_len = sizeof(message->author_name) - 1;
+        }
+        std::memcpy(message->author_name, author_name, author_len);
+        message->author_name[author_len] = '\0';
+        message->author_name_len = static_cast<uint32_t>(author_len);
+
+        size_t content_len = std::strlen(content);
+        if (content_len >= sizeof(message->content)) {
+            content_len = sizeof(message->content) - 1;
+        }
+        std::memcpy(message->content, content, content_len);
+        message->content[content_len] = '\0';
+        message->content_len = static_cast<uint32_t>(content_len);
     }
 
     bool is_open() const { return mapped_; }
