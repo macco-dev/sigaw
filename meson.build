@@ -214,6 +214,17 @@ test(
   overlay_visibility_test,
 )
 
+overlay_animation_test = executable(
+  'sigaw-overlay-animation-test',
+  'tests/overlay_animation_test.cpp',
+  include_directories: include_directories('src'),
+)
+
+test(
+  'sigaw-overlay-animation',
+  overlay_animation_test,
+)
+
 config_watcher_test = executable(
   'sigaw-config-watcher-test',
   'tests/config_watcher_test.cpp',

@@ -17,6 +17,7 @@
 #include FT_FREETYPE_H
 #include <png.h>
 
+#include "overlay_animation.h"
 #include "overlay_layout.h"
 #include "overlay_visibility.h"
 #include "shm_reader.h"
@@ -841,6 +842,8 @@ struct Ctx {
     PBuf             panel;
     TextSystem       text;
     AvatarStore      avatars;
+    std::unordered_map<uint64_t, float> speaking_times_ms;
+    std::chrono::steady_clock::time_point last_speaking_tick = {};
     bool             debug = false;
     bool             logged_first_render = false;
     bool             ok = false;
@@ -888,8 +891,51 @@ static void refresh_config(Ctx& ctx, bool force = false)
     }
 }
 
+static void reset_speaking_animation(Ctx& ctx)
+{
+    ctx.speaking_times_ms.clear();
+    ctx.last_speaking_tick = {};
+}
+
+static float speaking_frame_delta_ms(Ctx& ctx, std::chrono::steady_clock::time_point now)
+{
+    float dt_ms = 0.0f;
+    if (ctx.last_speaking_tick != std::chrono::steady_clock::time_point{}) {
+        dt_ms = std::chrono::duration<float, std::milli>(now - ctx.last_speaking_tick).count();
+    }
+    ctx.last_speaking_tick = now;
+    return std::clamp(dt_ms, 0.0f, sigaw::overlay::speaking_fade_ms);
+}
+
+static void update_speaking_animation(Ctx& ctx, const SigawState& vs, float dt_ms)
+{
+    for (uint32_t i = 0; i < vs.user_count; ++i) {
+        const auto& user = vs.users[i];
+        auto& progress_ms = ctx.speaking_times_ms[user.user_id];
+        progress_ms = sigaw::overlay::advance_speaking_time(progress_ms, user.speaking != 0, dt_ms);
+    }
+
+    for (auto it = ctx.speaking_times_ms.begin(); it != ctx.speaking_times_ms.end(); ) {
+        bool present = false;
+        for (uint32_t i = 0; i < vs.user_count; ++i) {
+            if (vs.users[i].user_id == it->first) {
+                present = true;
+                break;
+            }
+        }
+
+        if (!present) {
+            it = ctx.speaking_times_ms.erase(it);
+            continue;
+        }
+
+        ++it;
+    }
+}
+
 static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
-                        PBuf& pb, TextSystem& text, AvatarStore& avatars)
+                        PBuf& pb, TextSystem& text, AvatarStore& avatars,
+                        const std::unordered_map<uint64_t, float>& speaking_times_ms)
 {
     if (!text.ready()) {
         pb.init(0, 0);
@@ -1015,9 +1061,17 @@ static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
         }
 
         pb.ring(row.avatar_cx, row.avatar_cy, m.avatar_radius, m.avatar_stroke, avatar_stroke);
-        if (u.speaking) {
+        const auto speak_it = speaking_times_ms.find(u.user_id);
+        const float ring_alpha = speak_it == speaking_times_ms.end()
+            ? 0.0f
+            : sigaw::overlay::speaking_ring_alpha(speak_it->second);
+        if (ring_alpha > 0.0f) {
+            RGBA speaking_ring = speaking;
+            speaking_ring.a = static_cast<uint8_t>(
+                std::clamp(static_cast<float>(speaking_ring.a) * ring_alpha, 0.0f, 255.0f)
+            );
             pb.ring(row.avatar_cx, row.avatar_cy, m.avatar_radius + std::max(2, m.avatar_stroke + 1),
-                    std::max(2, m.avatar_stroke + 1), speaking);
+                    std::max(2, m.avatar_stroke + 1), speaking_ring);
         }
 
         if (cfg.compact && (u.self_deaf || u.server_deaf || u.self_mute || u.server_mute)) {
@@ -1280,7 +1334,14 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
         fprintf(stderr, "[sigaw] Debug: shared memory read unavailable, rendering fallback panel\n");
     }
 
-    build_panel(vs, c.cfg, c.panel, c.text, c.avatars);
+    if (have_voice_state) {
+        const auto now = std::chrono::steady_clock::now();
+        update_speaking_animation(c, vs, speaking_frame_delta_ms(c, now));
+    } else if (!c.shm.is_connected()) {
+        reset_speaking_animation(c);
+    }
+
+    build_panel(vs, c.cfg, c.panel, c.text, c.avatars, c.speaking_times_ms);
     if (c.panel.p.empty()) return 0;
 
     int margin = sigaw::overlay::scaled_px(c.cfg.scale, 16);
