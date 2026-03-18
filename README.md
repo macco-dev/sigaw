@@ -31,6 +31,36 @@ Gamescope, and X11 Vulkan apps.
 - Supports avatars, compact mode, and basic overlay placement controls
 - Runs as a daemon plus Vulkan layer, with `sigaw-ctl` for control and status
 
+## Example Overlays
+
+Generated from the current renderer on a 3840x2160 test frame. Regenerate them
+with `meson compile -C build render-readme-screenshots`. Click any crop to open
+the full 4K frame.
+
+### Standard layout
+
+<a href="assets/screenshots/overlay-standard.png">
+  <img src="assets/screenshots/overlay-standard-detail.png" width="100%" alt="Standard Sigaw overlay with a channel header, speaker highlight, and inline mute and deaf icons." />
+</a>
+
+Channel header, live speaking state, and inline mute icons.
+
+### Compact mode
+
+<a href="assets/screenshots/overlay-compact.png">
+  <img src="assets/screenshots/overlay-compact-detail.png" width="100%" alt="Compact Sigaw overlay with avatar-only rows, a speaking ring, and mute badges." />
+</a>
+
+Avatar-first rows with badge indicators.
+
+### Larger channels
+
+<a href="assets/screenshots/overlay-overflow.png">
+  <img src="assets/screenshots/overlay-overflow-detail.png" width="100%" alt="Sigaw overlay showing a larger voice channel collapsed into a plus more row." />
+</a>
+
+Extra users collapse into a <code>+N more</code> row.
+
 ## Limits
 
 - Linux only

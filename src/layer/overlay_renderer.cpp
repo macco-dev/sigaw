@@ -19,6 +19,7 @@
 
 #include "overlay_animation.h"
 #include "overlay_layout.h"
+#include "overlay_preview.h"
 #include "overlay_visibility.h"
 #include "shm_reader.h"
 #include "../common/config.h"
@@ -501,9 +502,15 @@ public:
 
     FontFaceCache() = default;
     ~FontFaceCache() {
+        reset();
+    }
+
+    void reset() {
         if (face_) {
             FT_Done_Face(face_);
+            face_ = nullptr;
         }
+        sizes_.clear();
     }
 
     bool load(FT_Library lib, const std::filesystem::path& path) {
@@ -595,8 +602,11 @@ enum class FontRole {
 class TextSystem {
 public:
     ~TextSystem() {
+        regular_face_.reset();
+        semibold_face_.reset();
         if (lib_) {
             FT_Done_FreeType(lib_);
+            lib_ = nullptr;
         }
     }
 
@@ -616,6 +626,8 @@ public:
             semibold = find_asset_path("fonts/SourceSans3-Semibold.otf");
         }
         if (!regular_face_.load(lib_, regular) || !semibold_face_.load(lib_, semibold)) {
+            regular_face_.reset();
+            semibold_face_.reset();
             FT_Done_FreeType(lib_);
             lib_ = nullptr;
             return false;
@@ -1169,7 +1181,110 @@ static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
     }
 }
 
+static sigaw::preview::Placement panel_placement(const sigaw::Config& cfg,
+                                                 uint32_t panel_w, uint32_t panel_h,
+                                                 uint32_t screen_w, uint32_t screen_h)
+{
+    const int margin = sigaw::overlay::scaled_px(cfg.scale, 16);
+    int x = 0;
+    int y = 0;
+    switch (cfg.position) {
+        case sigaw::OverlayPosition::TopLeft:
+            x = margin;
+            y = margin;
+            break;
+        case sigaw::OverlayPosition::TopRight:
+            x = static_cast<int>(screen_w) - static_cast<int>(panel_w) - margin;
+            y = margin;
+            break;
+        case sigaw::OverlayPosition::BottomLeft:
+            x = margin;
+            y = static_cast<int>(screen_h) - static_cast<int>(panel_h) - margin;
+            break;
+        case sigaw::OverlayPosition::BottomRight:
+            x = static_cast<int>(screen_w) - static_cast<int>(panel_w) - margin;
+            y = static_cast<int>(screen_h) - static_cast<int>(panel_h) - margin;
+            break;
+    }
+
+    x = std::max(0, std::min(x, static_cast<int>(screen_w) - static_cast<int>(panel_w)));
+    y = std::max(0, std::min(y, static_cast<int>(screen_h) - static_cast<int>(panel_h)));
+    return {x, y};
+}
+
+static bool render_panel_rgba_internal(const SigawState& state, const sigaw::Config& cfg,
+                                       const std::unordered_map<uint64_t, float>& speaking_times_ms,
+                                       sigaw::preview::Image& out)
+{
+    TextSystem text;
+    AvatarStore avatars;
+    PBuf panel;
+    build_panel(state, cfg, panel, text, avatars, speaking_times_ms);
+    if (panel.p.empty() || panel.w == 0 || panel.h == 0) {
+        out = {};
+        return false;
+    }
+
+    out.width = panel.w;
+    out.height = panel.h;
+    out.rgba.resize(static_cast<size_t>(panel.w) * panel.h * 4u);
+    for (size_t i = 0; i < panel.p.size(); ++i) {
+        out.rgba[i * 4 + 0] = panel.p[i].r;
+        out.rgba[i * 4 + 1] = panel.p[i].g;
+        out.rgba[i * 4 + 2] = panel.p[i].b;
+        out.rgba[i * 4 + 3] = panel.p[i].a;
+    }
+    return true;
+}
+
+static bool write_png_internal(const std::filesystem::path& path, const sigaw::preview::Image& image)
+{
+    if (image.width == 0 || image.height == 0 ||
+        image.rgba.size() != static_cast<size_t>(image.width) * image.height * 4u) {
+        return false;
+    }
+
+    if (!path.parent_path().empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        if (ec) {
+            return false;
+        }
+    }
+
+    png_image png = {};
+    png.version = PNG_IMAGE_VERSION;
+    png.width = image.width;
+    png.height = image.height;
+    png.format = PNG_FORMAT_RGBA;
+    return png_image_write_to_file(
+        &png, path.string().c_str(), 0, image.rgba.data(), 0, nullptr
+    ) != 0;
+}
+
 } /* anon */
+
+namespace sigaw::preview {
+
+bool render_panel_rgba(const SigawState& state, const sigaw::Config& cfg,
+                       const std::unordered_map<uint64_t, float>& speaking_times_ms,
+                       Image& out)
+{
+    return render_panel_rgba_internal(state, cfg, speaking_times_ms, out);
+}
+
+Placement place_panel(const sigaw::Config& cfg, uint32_t panel_w, uint32_t panel_h,
+                      uint32_t screen_w, uint32_t screen_h)
+{
+    return panel_placement(cfg, panel_w, panel_h, screen_w, screen_h);
+}
+
+bool write_png(const std::filesystem::path& path, const Image& image)
+{
+    return write_png_internal(path, image);
+}
+
+} /* namespace sigaw::preview */
 
 /* ======================================================================== */
 /*  C API                                                                    */
@@ -1344,17 +1459,9 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
     build_panel(vs, c.cfg, c.panel, c.text, c.avatars, c.speaking_times_ms);
     if (c.panel.p.empty()) return 0;
 
-    int margin = sigaw::overlay::scaled_px(c.cfg.scale, 16);
-    int px = 0, py = 0;
-    switch (c.cfg.position) {
-        case sigaw::OverlayPosition::TopLeft:     px = margin; py = margin; break;
-        case sigaw::OverlayPosition::TopRight:    px = (int)width-(int)c.panel.w-margin; py = margin; break;
-        case sigaw::OverlayPosition::BottomLeft:  px = margin; py = (int)height-(int)c.panel.h-margin; break;
-        case sigaw::OverlayPosition::BottomRight: px = (int)width-(int)c.panel.w-margin;
-                                                   py = (int)height-(int)c.panel.h-margin; break;
-    }
-    px = std::max(0, std::min(px, (int)width-(int)c.panel.w));
-    py = std::max(0, std::min(py, (int)height-(int)c.panel.h));
+    const auto placement = panel_placement(c.cfg, c.panel.w, c.panel.h, width, height);
+    const int px = placement.x;
+    const int py = placement.y;
     uint32_t cw = std::min(c.panel.w, width-(uint32_t)px);
     uint32_t ch = std::min(c.panel.h, height-(uint32_t)py);
     if (!cw || !ch) return 0;

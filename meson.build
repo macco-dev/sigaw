@@ -69,12 +69,15 @@ layer_sources = [
   'src/layer/overlay_renderer.cpp',
 ]
 
-layer_cpp_args = [
-  '-fPIC',
-  '-fvisibility=hidden',
+overlay_cpp_args = [
   '-DSIGAW_DATA_DIR="' + (datadir_abs / 'sigaw') + '"',
   '-DSIGAW_SOURCE_DIR="' + meson.current_source_dir() + '"',
 ]
+
+layer_cpp_args = [
+  '-fPIC',
+  '-fvisibility=hidden',
+] + overlay_cpp_args
 
 layer_lib = shared_library(
   'Sigaw',
@@ -161,6 +164,26 @@ ctl_bin = executable(
   install: true,
 )
 
+screenshot_bin = executable(
+  'sigaw-render-screenshots',
+  [
+    'src/tools/render_screenshots.cpp',
+    'src/layer/overlay_renderer.cpp',
+  ],
+  include_directories: include_directories('src'),
+  dependencies: [vulkan_dep, rt_dep, thread_dep, freetype_dep, png_dep],
+  cpp_args: overlay_cpp_args,
+)
+
+run_target(
+  'render-readme-screenshots',
+  command: [
+    screenshot_bin,
+    '--output-dir',
+    meson.current_source_dir() / 'assets' / 'screenshots',
+  ],
+)
+
 test(
   'sigaw-daemon-help',
   daemon_bin,
@@ -178,6 +201,12 @@ test(
   'sigaw-ctl-help',
   ctl_bin,
   args: ['help'],
+)
+
+test(
+  'sigaw-render-screenshots',
+  screenshot_bin,
+  args: ['--output-dir', meson.current_build_dir() / 'test-screenshots'],
 )
 
 json_utils_test = executable(
