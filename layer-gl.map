@@ -1,0 +1,9 @@
+{
+  global:
+    glXSwapBuffers;
+    glXDestroyContext;
+    eglSwapBuffers;
+    eglDestroyContext;
+  local:
+    *;
+};

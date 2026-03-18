@@ -270,7 +270,7 @@ private:
         }
 
         f << "# Sigaw configuration\n"
-          << "# Discord voice overlay for Linux (Vulkan layer)\n"
+          << "# Discord voice overlay for Linux (Vulkan + OpenGL)\n"
           << "#\n"
           << "# Position: top-left, top-right, bottom-left, bottom-right\n"
           << "position=" << position_name(position) << "\n"

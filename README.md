@@ -8,7 +8,7 @@
 </p>
 
 **Sigaw** renders a Discord voice channel overlay directly inside your game's
-Vulkan render pipeline, using the same approach as MangoHUD and DXVK. No
+Vulkan or OpenGL render pipeline, using the same approach as MangoHUD and DXVK. No
 transparent windows, no compositor hacks, no Wayland limitations.
 
 ## Why?
@@ -18,10 +18,11 @@ window on top of the game. On Linux, that is unreliable for fullscreen Wayland
 apps because the compositor is not supposed to let another window draw over the
 game surface.
 
-Sigaw takes a different route. It is a **Vulkan implicit layer**, so the voice
-overlay is drawn inside the application's own frame instead of by the desktop.
+Sigaw takes a different route. It injects the overlay into the application's
+own frame instead of relying on the desktop compositor: a **Vulkan implicit
+layer** for Vulkan apps, and an **`LD_PRELOAD` swap-buffer hook** for OpenGL.
 That makes it work in the cases this project is meant for: Wayland fullscreen,
-Gamescope, and X11 Vulkan apps.
+Gamescope, X11 Vulkan apps, and X11/EGL OpenGL apps.
 
 ## Features
 
@@ -29,7 +30,7 @@ Gamescope, and X11 Vulkan apps.
 - Updates speaking, mute, and deaf state live
 - Keeps active speakers visible when the channel is larger than the visible row limit
 - Supports avatars, compact mode, and basic overlay placement controls
-- Runs as a daemon plus Vulkan layer, with `sigaw-ctl` for control and status
+- Runs as a daemon plus Vulkan/OpenGL hooks, with `sigaw-ctl` for control and status
 
 ## Example Overlays
 
@@ -58,7 +59,7 @@ with `meson compile -C build render-readme-screenshots`.
 ## Limits
 
 - Linux only
-- Vulkan applications only
+- Vulkan applications, plus OpenGL via GLX/EGL
 - Discord desktop client only
 - Voice overlay only
 
@@ -96,17 +97,24 @@ systemctl --user enable --now sigaw-daemon
 
 On first run, Discord should prompt for authorization.
 
-### 4. Launch a Vulkan app with Sigaw enabled
+### 4. Launch an app with Sigaw enabled
 
 ```bash
-SIGAW=1 ./my-game
+sigaw-run ./my-game
 ```
 
 Common launch patterns:
 
 ```bash
-SIGAW=1 %command%
-SIGAW=1 gamescope -f -- %command%
+sigaw-run %command%
+sigaw-run -- gamescope -f -- %command%
+```
+
+Manual paths:
+
+```bash
+SIGAW=1 ./vulkan-game
+LD_PRELOAD=/usr/lib/libSigawGL.so ./opengl-game
 ```
 
 ### 5. Check that it is working
@@ -123,12 +131,13 @@ shows the current channel, users, and overlay visibility state.
 Runtime:
 
 - Linux
-- A Vulkan-capable game or application
+- A Vulkan or OpenGL game/application
 - Discord desktop app running on the same machine
 
 Build:
 
 - Vulkan headers and loader
+- OpenGL/EGL/X11 development files
 - Meson
 - Ninja
 - nlohmann-json
@@ -184,10 +193,12 @@ Example config: [`sigaw.conf.example`](sigaw.conf.example).
 
 If the overlay does not appear:
 
-- Make sure the target app is using Vulkan.
-- Start it with `SIGAW=1`.
+- Start it with `sigaw-run <game>`.
+- For Vulkan-only debugging, try `SIGAW=1 <game>`.
+- For OpenGL-only debugging, try `LD_PRELOAD=/usr/lib/libSigawGL.so <game>`.
 - Verify the daemon is running with `sigaw-ctl status`.
 - If you installed from source, confirm `sudo meson install -C build` completed successfully.
+- Avoid stacking another swap-buffer interposer on top of Sigaw.
 
 If Discord never prompts for authorization:
 

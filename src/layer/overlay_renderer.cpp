@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -20,6 +21,7 @@
 #include "overlay_animation.h"
 #include "overlay_layout.h"
 #include "overlay_preview.h"
+#include "overlay_runtime.h"
 #include "overlay_visibility.h"
 #include "shm_reader.h"
 #include "../common/config.h"
@@ -848,15 +850,7 @@ struct Ctx {
     void*            sptr = nullptr;
     VkDeviceSize     ssz  = 0;
 
-    sigaw::ShmReader shm;
-    sigaw::Config    cfg;
-    sigaw::ConfigWatcher cfg_watch;
-    PBuf             panel;
-    TextSystem       text;
-    AvatarStore      avatars;
-    std::unordered_map<uint64_t, float> speaking_times_ms;
-    std::chrono::steady_clock::time_point last_speaking_tick = {};
-    bool             debug = false;
+    sigaw::overlay::Runtime runtime;
     bool             logged_first_render = false;
     bool             ok = false;
 };
@@ -889,61 +883,6 @@ static uint32_t find_mem(Ctx& ctx, VkPhysicalDevice pd, uint32_t bits, VkMemoryP
 }
 
 /* ---- Panel rendering ---- */
-
-static void refresh_config(Ctx& ctx, bool force = false)
-{
-    if (force) {
-        ctx.cfg = sigaw::Config::load();
-        ctx.cfg_watch.sync();
-        return;
-    }
-
-    if (ctx.cfg_watch.consume_change()) {
-        ctx.cfg = sigaw::Config::load();
-    }
-}
-
-static void reset_speaking_animation(Ctx& ctx)
-{
-    ctx.speaking_times_ms.clear();
-    ctx.last_speaking_tick = {};
-}
-
-static float speaking_frame_delta_ms(Ctx& ctx, std::chrono::steady_clock::time_point now)
-{
-    float dt_ms = 0.0f;
-    if (ctx.last_speaking_tick != std::chrono::steady_clock::time_point{}) {
-        dt_ms = std::chrono::duration<float, std::milli>(now - ctx.last_speaking_tick).count();
-    }
-    ctx.last_speaking_tick = now;
-    return std::clamp(dt_ms, 0.0f, sigaw::overlay::speaking_fade_ms);
-}
-
-static void update_speaking_animation(Ctx& ctx, const SigawState& vs, float dt_ms)
-{
-    for (uint32_t i = 0; i < vs.user_count; ++i) {
-        const auto& user = vs.users[i];
-        auto& progress_ms = ctx.speaking_times_ms[user.user_id];
-        progress_ms = sigaw::overlay::advance_speaking_time(progress_ms, user.speaking != 0, dt_ms);
-    }
-
-    for (auto it = ctx.speaking_times_ms.begin(); it != ctx.speaking_times_ms.end(); ) {
-        bool present = false;
-        for (uint32_t i = 0; i < vs.user_count; ++i) {
-            if (vs.users[i].user_id == it->first) {
-                present = true;
-                break;
-            }
-        }
-
-        if (!present) {
-            it = ctx.speaking_times_ms.erase(it);
-            continue;
-        }
-
-        ++it;
-    }
-}
 
 static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
                         PBuf& pb, TextSystem& text, AvatarStore& avatars,
@@ -1216,6 +1155,11 @@ static bool render_panel_rgba_internal(const SigawState& state, const sigaw::Con
                                        const std::unordered_map<uint64_t, float>& speaking_times_ms,
                                        sigaw::preview::Image& out)
 {
+    if (!cfg.visible) {
+        out = {};
+        return false;
+    }
+
     TextSystem text;
     AvatarStore avatars;
     PBuf panel;
@@ -1286,6 +1230,164 @@ bool write_png(const std::filesystem::path& path, const Image& image)
 
 } /* namespace sigaw::preview */
 
+namespace sigaw::overlay {
+
+struct Runtime::Impl {
+    sigaw::ShmReader shm;
+    sigaw::Config cfg;
+    sigaw::ConfigWatcher cfg_watch;
+    PBuf panel;
+    TextSystem text;
+    AvatarStore avatars;
+    std::unordered_map<uint64_t, float> speaking_times_ms;
+    std::chrono::steady_clock::time_point last_speaking_tick = {};
+    bool debug = std::getenv("SIGAW_DEBUG") != nullptr;
+
+    void refresh_config(bool force = false) {
+        if (force) {
+            cfg = sigaw::Config::load();
+            cfg_watch.sync();
+            return;
+        }
+
+        if (cfg_watch.consume_change()) {
+            cfg = sigaw::Config::load();
+        }
+    }
+
+    void reset_speaking_animation() {
+        speaking_times_ms.clear();
+        last_speaking_tick = {};
+    }
+
+    float speaking_frame_delta_ms(std::chrono::steady_clock::time_point now) {
+        float dt_ms = 0.0f;
+        if (last_speaking_tick != std::chrono::steady_clock::time_point{}) {
+            dt_ms = std::chrono::duration<float, std::milli>(now - last_speaking_tick).count();
+        }
+        last_speaking_tick = now;
+        return std::clamp(dt_ms, 0.0f, sigaw::overlay::speaking_fade_ms);
+    }
+
+    void update_speaking_animation(const SigawState& vs, float dt_ms) {
+        for (uint32_t i = 0; i < vs.user_count; ++i) {
+            const auto& user = vs.users[i];
+            auto& progress_ms = speaking_times_ms[user.user_id];
+            progress_ms = sigaw::overlay::advance_speaking_time(progress_ms, user.speaking != 0, dt_ms);
+        }
+
+        for (auto it = speaking_times_ms.begin(); it != speaking_times_ms.end(); ) {
+            bool present = false;
+            for (uint32_t i = 0; i < vs.user_count; ++i) {
+                if (vs.users[i].user_id == it->first) {
+                    present = true;
+                    break;
+                }
+            }
+
+            if (!present) {
+                it = speaking_times_ms.erase(it);
+                continue;
+            }
+
+            ++it;
+        }
+    }
+
+    PreparedFrame prepare(uint32_t surface_width, uint32_t surface_height) {
+        PreparedFrame out;
+
+        refresh_config();
+        if (!cfg.visible || surface_width == 0 || surface_height == 0) {
+            return out;
+        }
+
+        SigawState vs = {};
+        const bool have_voice_state = shm.read(vs);
+        if (debug && !have_voice_state) {
+            fprintf(stderr, "[sigaw] Debug: shared memory read unavailable, rendering fallback panel\n");
+        }
+
+        if (have_voice_state) {
+            const auto now = std::chrono::steady_clock::now();
+            update_speaking_animation(vs, speaking_frame_delta_ms(now));
+        } else if (!shm.is_connected()) {
+            reset_speaking_animation();
+        }
+
+        build_panel(vs, cfg, panel, text, avatars, speaking_times_ms);
+        if (panel.p.empty() || panel.w == 0 || panel.h == 0) {
+            return out;
+        }
+
+        const auto placement = panel_placement(cfg, panel.w, panel.h, surface_width, surface_height);
+        const uint32_t crop_w = std::min(panel.w, surface_width - static_cast<uint32_t>(placement.x));
+        const uint32_t crop_h = std::min(panel.h, surface_height - static_cast<uint32_t>(placement.y));
+        if (crop_w == 0 || crop_h == 0) {
+            return out;
+        }
+
+        out.placement = placement;
+        out.image.width = crop_w;
+        out.image.height = crop_h;
+        out.image.rgba.resize(static_cast<size_t>(crop_w) * crop_h * 4u);
+        for (uint32_t y = 0; y < crop_h; ++y) {
+            for (uint32_t x = 0; x < crop_w; ++x) {
+                const auto& src = panel.p[static_cast<size_t>(y) * panel.w + x];
+                const size_t idx = (static_cast<size_t>(y) * crop_w + x) * 4u;
+                out.image.rgba[idx + 0] = src.r;
+                out.image.rgba[idx + 1] = src.g;
+                out.image.rgba[idx + 2] = src.b;
+                out.image.rgba[idx + 3] = src.a;
+            }
+        }
+        return out;
+    }
+};
+
+Runtime::Runtime() : impl_(std::make_unique<Impl>()) {
+    impl_->refresh_config(true);
+}
+
+Runtime::~Runtime() = default;
+
+Runtime::Runtime(Runtime&&) noexcept = default;
+
+Runtime& Runtime::operator=(Runtime&&) noexcept = default;
+
+PreparedFrame Runtime::prepare(uint32_t surface_width, uint32_t surface_height) {
+    return impl_->prepare(surface_width, surface_height);
+}
+
+bool Runtime::debug_enabled() const {
+    return impl_ && impl_->debug;
+}
+
+} /* namespace sigaw::overlay */
+
+static void composite_image_over(void* dst, VkFormat fmt, const sigaw::preview::Image& image)
+{
+    auto* out = static_cast<uint8_t*>(dst);
+    for (uint32_t y = 0; y < image.height; ++y) {
+        for (uint32_t x = 0; x < image.width; ++x) {
+            const size_t idx = (static_cast<size_t>(y) * image.width + x) * 4u;
+            const RGBA src = {
+                image.rgba[idx + 0],
+                image.rgba[idx + 1],
+                image.rgba[idx + 2],
+                image.rgba[idx + 3],
+            };
+            if (src.a == 0) {
+                continue;
+            }
+
+            uint8_t* px = out + idx;
+            const RGBA dst_px = PBuf::load_pixel(px, fmt);
+            PBuf::store_pixel(px, fmt, alpha_blend(dst_px, src));
+        }
+    }
+}
+
 /* ======================================================================== */
 /*  C API                                                                    */
 /* ======================================================================== */
@@ -1319,7 +1421,6 @@ static void destroy_overlay_context(Ctx* ctx, bool wait_idle)
         vkDestroyCommandPool(ctx->dev, ctx->pool, nullptr);
         ctx->pool = VK_NULL_HANDLE;
     }
-    ctx->shm.close();
     ctx->ok = false;
 }
 
@@ -1341,9 +1442,7 @@ SigawOverlayContext* sigaw_overlay_create(VkDevice device, VkPhysicalDevice phys
     c.fmt = format;
     c.sw = width;
     c.sh = height;
-    c.debug = std::getenv("SIGAW_DEBUG") != nullptr;
     c.logged_first_render = false;
-    refresh_config(c, true);
 
     VkCommandPoolCreateInfo pi = {};
     pi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1429,8 +1528,7 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
     }
 
     auto& c = *ctx;
-    refresh_config(c);
-    if (!c.ok || !c.cfg.visible) return 0;
+    if (!c.ok) return 0;
 
     if (!supports_staging_copy_format(format)) {
         static VkFormat logged_format = VK_FORMAT_UNDEFINED;
@@ -1443,35 +1541,20 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
         return 0;
     }
 
-    SigawState vs = {};
-    const bool have_voice_state = c.shm.read(vs);
-    if (c.debug && !have_voice_state) {
-        fprintf(stderr, "[sigaw] Debug: shared memory read unavailable, rendering fallback panel\n");
-    }
+    const auto frame = c.runtime.prepare(width, height);
+    if (frame.empty()) return 0;
 
-    if (have_voice_state) {
-        const auto now = std::chrono::steady_clock::now();
-        update_speaking_animation(c, vs, speaking_frame_delta_ms(c, now));
-    } else if (!c.shm.is_connected()) {
-        reset_speaking_animation(c);
-    }
-
-    build_panel(vs, c.cfg, c.panel, c.text, c.avatars, c.speaking_times_ms);
-    if (c.panel.p.empty()) return 0;
-
-    const auto placement = panel_placement(c.cfg, c.panel.w, c.panel.h, width, height);
-    const int px = placement.x;
-    const int py = placement.y;
-    uint32_t cw = std::min(c.panel.w, width-(uint32_t)px);
-    uint32_t ch = std::min(c.panel.h, height-(uint32_t)py);
-    if (!cw || !ch) return 0;
-    const size_t bytes = (size_t)cw * ch * 4;
+    const int px = frame.placement.x;
+    const int py = frame.placement.y;
+    const uint32_t cw = frame.image.width;
+    const uint32_t ch = frame.image.height;
+    const size_t bytes = frame.image.rgba.size();
     if (bytes > (size_t)c.ssz) return 0;
 
-    if (c.debug && !c.logged_first_render) {
+    if (c.runtime.debug_enabled() && !c.logged_first_render) {
         fprintf(stderr,
-                "[sigaw] Debug: first render submit panel=%ux%u users=%u pos=%d fmt=%d target=%ux%u\n",
-                c.panel.w, c.panel.h, vs.user_count, (int)c.cfg.position, format, width, height);
+                "[sigaw] Debug: first render submit panel=%ux%u fmt=%d target=%ux%u at=%d,%d\n",
+                cw, ch, format, width, height, px, py);
         c.logged_first_render = true;
     }
 
@@ -1525,7 +1608,7 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
     }
 
     vkWaitForFences(c.dev, 1, &c.fen, VK_TRUE, UINT64_MAX);
-    c.panel.composite_over(c.sptr, format, cw, ch);
+    composite_image_over(c.sptr, format, frame.image);
 
     vkResetFences(c.dev, 1, &c.fen);
     vkResetCommandBuffer(c.cmd, 0);

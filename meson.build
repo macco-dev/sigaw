@@ -36,12 +36,16 @@ cpp = meson.get_compiler('cpp')
 
 # Vulkan (headers + loader)
 vulkan_dep = dependency('vulkan', required: true)
+gl_dep = dependency('gl', required: true)
+egl_dep = dependency('egl', required: true)
+x11_dep = dependency('x11', required: true)
 
 # POSIX threads
 thread_dep = dependency('threads', required: true)
 
 # POSIX realtime (for shm_open)
 rt_dep = cc.find_library('rt', required: true)
+dl_dep = cc.find_library('dl', required: true)
 
 # nlohmann/json (daemon only)
 # Try system install first, fall back to subproject
@@ -91,6 +95,38 @@ layer_lib = shared_library(
   # Export only the Vulkan layer entry points
   link_args: [
     '-Wl,--version-script,' + meson.current_source_dir() / 'layer.map',
+  ],
+)
+
+layer_gl_cpp_args = [
+  '-fPIC',
+  '-fvisibility=hidden',
+  '-DSIGAW_DATA_DIR="' + (datadir_abs / 'sigaw') + '"',
+  '-DSIGAW_SOURCE_DIR="' + meson.current_source_dir() + '"',
+]
+
+layer_gl_lib = shared_library(
+  'SigawGL',
+  [
+    'src/layer/overlay_gl.cpp',
+    'src/layer/overlay_renderer.cpp',
+  ],
+  include_directories: include_directories('src'),
+  dependencies: [
+    vulkan_dep,
+    gl_dep,
+    egl_dep,
+    x11_dep,
+    dl_dep,
+    rt_dep,
+    thread_dep,
+    freetype_dep,
+    png_dep,
+  ],
+  install: true,
+  cpp_args: layer_gl_cpp_args,
+  link_args: [
+    '-Wl,--version-script,' + meson.current_source_dir() / 'layer-gl.map',
   ],
 )
 
@@ -164,6 +200,19 @@ ctl_bin = executable(
   install: true,
 )
 
+sigaw_run_bin = executable(
+  'sigaw-run',
+  [
+    'src/run/main.cpp',
+    'src/run/launcher_env.cpp',
+  ],
+  include_directories: include_directories('src'),
+  cpp_args: [
+    '-DSIGAW_GL_PRELOAD_PATH="' + (libdir_abs / 'libSigawGL.so') + '"',
+  ],
+  install: true,
+)
+
 screenshot_bin = executable(
   'sigaw-render-screenshots',
   [
@@ -201,6 +250,18 @@ test(
   'sigaw-ctl-help',
   ctl_bin,
   args: ['help'],
+)
+
+test(
+  'sigaw-run-help',
+  sigaw_run_bin,
+  args: ['--help'],
+)
+
+test(
+  'sigaw-run-missing-command',
+  sigaw_run_bin,
+  should_fail: true,
 )
 
 test(
@@ -254,6 +315,22 @@ test(
   overlay_animation_test,
 )
 
+overlay_panel_test = executable(
+  'sigaw-overlay-panel-test',
+  [
+    'tests/overlay_panel_test.cpp',
+    'src/layer/overlay_renderer.cpp',
+  ],
+  include_directories: include_directories('src'),
+  dependencies: [vulkan_dep, rt_dep, thread_dep, freetype_dep, png_dep],
+  cpp_args: layer_cpp_args,
+)
+
+test(
+  'sigaw-overlay-panel',
+  overlay_panel_test,
+)
+
 config_watcher_test = executable(
   'sigaw-config-watcher-test',
   'tests/config_watcher_test.cpp',
@@ -301,14 +378,30 @@ test(
   daemon_voice_runtime_test,
 )
 
+launcher_env_test = executable(
+  'sigaw-launcher-env-test',
+  [
+    'tests/launcher_env_test.cpp',
+    'src/run/launcher_env.cpp',
+  ],
+  include_directories: include_directories('src'),
+)
+
+test(
+  'sigaw-launcher-env',
+  launcher_env_test,
+)
+
 # --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
 
 summary({
   'Vulkan layer': true,
+  'OpenGL preload': true,
   'Daemon': true,
   'CLI tool': true,
+  'Launcher': true,
   'libcurl (OAuth)': curl_dep.found(),
   'nlohmann/json': json_dep.found(),
   'FreeType': freetype_dep.found(),

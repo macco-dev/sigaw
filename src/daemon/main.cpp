@@ -80,13 +80,13 @@ static void print_usage(const char* prog) {
         "\n"
         "The daemon connects to Discord's local IPC socket and publishes\n"
         "voice channel state to shared memory (%s) for the\n"
-        "Vulkan overlay layer to read.\n"
+        "Vulkan/OpenGL overlay hooks to read.\n"
         "\n"
         "Setup:\n"
         "  1. Run: sigaw-daemon --init-config\n"
         "  2. Run: sigaw-daemon --foreground\n"
         "  3. Approve the authorization in Discord (one-time)\n"
-        "  4. Launch games with: SIGAW=1 <game>\n",
+        "  4. Launch games with: sigaw-run <game>\n",
         prog, shm_name.c_str()
     );
 }
