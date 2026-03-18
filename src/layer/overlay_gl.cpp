@@ -956,24 +956,30 @@ static ContextApi current_egl_api()
 
 static bool upload_texture(ContextState& state, const sigaw::overlay::PreparedFrame& frame)
 {
+    const bool resized =
+        state.texture_width != frame.width || state.texture_height != frame.height;
+    if (!frame.changed && !resized) {
+        return true;
+    }
+
     g_gl.ActiveTexture(GL_TEXTURE0);
     g_gl.BindTexture(GL_TEXTURE_2D, state.texture);
     g_gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    if (state.texture_width != frame.image.width || state.texture_height != frame.image.height) {
+    if (resized) {
         g_gl.TexImage2D(
             GL_TEXTURE_2D,
             0,
             GL_RGBA,
-            static_cast<GLsizei>(frame.image.width),
-            static_cast<GLsizei>(frame.image.height),
+            static_cast<GLsizei>(frame.width),
+            static_cast<GLsizei>(frame.height),
             0,
             GL_RGBA,
             GL_UNSIGNED_BYTE,
-            frame.image.rgba.data()
+            frame.rgba
         );
-        state.texture_width = frame.image.width;
-        state.texture_height = frame.image.height;
+        state.texture_width = frame.width;
+        state.texture_height = frame.height;
         return true;
     }
 
@@ -982,11 +988,11 @@ static bool upload_texture(ContextState& state, const sigaw::overlay::PreparedFr
         0,
         0,
         0,
-        static_cast<GLsizei>(frame.image.width),
-        static_cast<GLsizei>(frame.image.height),
+        static_cast<GLsizei>(frame.width),
+        static_cast<GLsizei>(frame.height),
         GL_RGBA,
         GL_UNSIGNED_BYTE,
-        frame.image.rgba.data()
+        frame.rgba
     );
     return true;
 }
@@ -1026,8 +1032,8 @@ static bool render_overlay(ContextState& state, ContextApi api,
     g_gl.Uniform4f(state.uniform_panel_rect,
                    static_cast<GLfloat>(frame.placement.x),
                    static_cast<GLfloat>(frame.placement.y),
-                   static_cast<GLfloat>(frame.image.width),
-                   static_cast<GLfloat>(frame.image.height));
+                   static_cast<GLfloat>(frame.width),
+                   static_cast<GLfloat>(frame.height));
 
     if (state.use_vao) {
         bind_vao(state.vao, state.use_oes_vao);

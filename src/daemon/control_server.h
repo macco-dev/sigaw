@@ -22,6 +22,7 @@ class ControlServer {
 public:
     enum class Action {
         None,
+        Refresh,
         Reload,
         Quit,
     };
@@ -123,11 +124,15 @@ public:
             }
             if (client_action == Action::Reload) {
                 action = Action::Reload;
+            } else if (client_action == Action::Refresh && action == Action::None) {
+                action = Action::Refresh;
             }
         }
 
         return action;
     }
+
+    int fd() const { return fd_; }
 
 private:
     int                   fd_ = -1;
@@ -190,7 +195,7 @@ private:
                     0,
                     config.visible ? "overlay visible" : "overlay hidden"
                 );
-                return Action::None;
+                return Action::Refresh;
 
             case SIGAW_CTL_RELOAD:
                 config = Config::load();

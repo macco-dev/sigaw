@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -23,9 +24,8 @@
 #include "overlay_preview.h"
 #include "overlay_runtime.h"
 #include "overlay_visibility.h"
-#include "shm_reader.h"
 #include "../common/config.h"
-#include "../common/config_watcher.h"
+#include "../common/overlay_frame_shm.h"
 #include "../common/protocol.h"
 
 extern "C" {
@@ -485,6 +485,24 @@ static std::filesystem::path find_asset_path(const std::filesystem::path& rel) {
     return {};
 }
 
+static std::filesystem::path find_shader_path(std::string_view name) {
+    std::vector<std::filesystem::path> candidates;
+#ifdef SIGAW_BUILD_DIR
+    candidates.emplace_back(std::filesystem::path(SIGAW_BUILD_DIR) / std::string(name));
+#endif
+#ifdef SIGAW_DATA_DIR
+    candidates.emplace_back(std::filesystem::path(SIGAW_DATA_DIR) / "shaders" / std::string(name));
+#endif
+
+    std::error_code ec;
+    for (const auto& candidate : candidates) {
+        if (!candidate.empty() && std::filesystem::exists(candidate, ec)) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
 class FontFaceCache {
 public:
     struct Metrics {
@@ -849,13 +867,36 @@ struct Ctx {
     VkDeviceMemory   smem = VK_NULL_HANDLE;
     void*            sptr = nullptr;
     VkDeviceSize     ssz  = 0;
+    VkImage          overlay_image = VK_NULL_HANDLE;
+    VkDeviceMemory   overlay_mem = VK_NULL_HANDLE;
+    VkImageView      overlay_view = VK_NULL_HANDLE;
+    VkImageLayout    overlay_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkSampler        sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout desc_layout = VK_NULL_HANDLE;
+    VkDescriptorPool desc_pool = VK_NULL_HANDLE;
+    VkDescriptorSet  desc_set = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkRenderPass     render_pass = VK_NULL_HANDLE;
+    VkPipeline       pipeline = VK_NULL_HANDLE;
+    uint32_t         overlay_width = 0;
+    uint32_t         overlay_height = 0;
+    uint64_t         uploaded_sequence = 0;
+
+    struct TargetView {
+        VkImageView  view = VK_NULL_HANDLE;
+        VkFramebuffer framebuffer = VK_NULL_HANDLE;
+        uint32_t     width = 0;
+        uint32_t     height = 0;
+        VkFormat     format = VK_FORMAT_UNDEFINED;
+    };
+    std::unordered_map<VkImage, TargetView> target_views;
 
     sigaw::overlay::Runtime runtime;
     bool             logged_first_render = false;
     bool             ok = false;
 };
 
-static bool supports_staging_copy_format(VkFormat fmt)
+static bool supports_overlay_format(VkFormat fmt)
 {
     switch (fmt) {
         case VK_FORMAT_R8G8B8A8_UNORM:
@@ -880,6 +921,484 @@ static uint32_t find_mem(Ctx& ctx, VkPhysicalDevice pd, uint32_t bits, VkMemoryP
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
         if ((bits & (1u<<i)) && (mp.memoryTypes[i].propertyFlags & f) == f) return i;
     return UINT32_MAX;
+}
+
+static std::vector<uint32_t> read_spirv(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        return {};
+    }
+
+    const std::streamsize size = file.tellg();
+    if (size <= 0) {
+        return {};
+    }
+    file.seekg(0, std::ios::beg);
+
+    std::vector<uint32_t> code(static_cast<size_t>(size + 3) / 4u, 0u);
+    if (!file.read(reinterpret_cast<char*>(code.data()), size)) {
+        return {};
+    }
+    return code;
+}
+
+static VkShaderModule create_shader_module(VkDevice device, const std::filesystem::path& path) {
+    const auto code = read_spirv(path);
+    if (code.empty()) {
+        return VK_NULL_HANDLE;
+    }
+
+    VkShaderModuleCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    info.codeSize = code.size() * sizeof(uint32_t);
+    info.pCode = code.data();
+
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(device, &info, nullptr, &module) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    return module;
+}
+
+static void destroy_target_views(Ctx& ctx) {
+    for (auto& [_, target] : ctx.target_views) {
+        if (target.framebuffer != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(ctx.dev, target.framebuffer, nullptr);
+        }
+        if (target.view != VK_NULL_HANDLE) {
+            vkDestroyImageView(ctx.dev, target.view, nullptr);
+        }
+    }
+    ctx.target_views.clear();
+}
+
+struct OverlayPushConstants {
+    float surface_size[2];
+    float panel_rect[4];
+};
+
+static bool ensure_staging_capacity(Ctx& ctx, size_t bytes) {
+    if (ctx.sbuf != VK_NULL_HANDLE && bytes <= static_cast<size_t>(ctx.ssz)) {
+        return true;
+    }
+
+    if (ctx.sptr != nullptr) {
+        vkUnmapMemory(ctx.dev, ctx.smem);
+        ctx.sptr = nullptr;
+    }
+    if (ctx.sbuf != VK_NULL_HANDLE) {
+        vkDestroyBuffer(ctx.dev, ctx.sbuf, nullptr);
+        ctx.sbuf = VK_NULL_HANDLE;
+    }
+    if (ctx.smem != VK_NULL_HANDLE) {
+        vkFreeMemory(ctx.dev, ctx.smem, nullptr);
+        ctx.smem = VK_NULL_HANDLE;
+    }
+
+    ctx.ssz = std::max<VkDeviceSize>(2 * 1024 * 1024, static_cast<VkDeviceSize>(bytes));
+
+    VkBufferCreateInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bi.size = ctx.ssz;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(ctx.dev, &bi, nullptr, &ctx.sbuf) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkMemoryRequirements mr = {};
+    vkGetBufferMemoryRequirements(ctx.dev, ctx.sbuf, &mr);
+
+    VkMemoryAllocateInfo ma = {};
+    ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ma.allocationSize = mr.size;
+    ma.memoryTypeIndex = find_mem(
+        ctx, ctx.pdev, mr.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    );
+    if (ma.memoryTypeIndex == UINT32_MAX ||
+        vkAllocateMemory(ctx.dev, &ma, nullptr, &ctx.smem) != VK_SUCCESS) {
+        return false;
+    }
+
+    vkBindBufferMemory(ctx.dev, ctx.sbuf, ctx.smem, 0);
+    if (vkMapMemory(ctx.dev, ctx.smem, 0, ctx.ssz, 0, &ctx.sptr) != VK_SUCCESS) {
+        return false;
+    }
+    return true;
+}
+
+static void destroy_overlay_texture(Ctx& ctx) {
+    if (ctx.overlay_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(ctx.dev, ctx.overlay_view, nullptr);
+        ctx.overlay_view = VK_NULL_HANDLE;
+    }
+    if (ctx.overlay_image != VK_NULL_HANDLE) {
+        vkDestroyImage(ctx.dev, ctx.overlay_image, nullptr);
+        ctx.overlay_image = VK_NULL_HANDLE;
+    }
+    if (ctx.overlay_mem != VK_NULL_HANDLE) {
+        vkFreeMemory(ctx.dev, ctx.overlay_mem, nullptr);
+        ctx.overlay_mem = VK_NULL_HANDLE;
+    }
+    ctx.overlay_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ctx.overlay_width = 0;
+    ctx.overlay_height = 0;
+    ctx.uploaded_sequence = 0;
+}
+
+static bool ensure_overlay_texture(Ctx& ctx, uint32_t width, uint32_t height) {
+    if (ctx.overlay_image != VK_NULL_HANDLE &&
+        ctx.overlay_width == width &&
+        ctx.overlay_height == height) {
+        return true;
+    }
+
+    destroy_overlay_texture(ctx);
+
+    VkImageCreateInfo ii = {};
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ii.extent = {width, height, 1};
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(ctx.dev, &ii, nullptr, &ctx.overlay_image) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkMemoryRequirements mr = {};
+    vkGetImageMemoryRequirements(ctx.dev, ctx.overlay_image, &mr);
+
+    VkMemoryAllocateInfo ma = {};
+    ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ma.allocationSize = mr.size;
+    ma.memoryTypeIndex = find_mem(ctx, ctx.pdev, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ma.memoryTypeIndex == UINT32_MAX) {
+        ma.memoryTypeIndex = find_mem(
+            ctx, ctx.pdev, mr.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+        );
+    }
+    if (ma.memoryTypeIndex == UINT32_MAX ||
+        vkAllocateMemory(ctx.dev, &ma, nullptr, &ctx.overlay_mem) != VK_SUCCESS) {
+        return false;
+    }
+
+    vkBindImageMemory(ctx.dev, ctx.overlay_image, ctx.overlay_mem, 0);
+
+    VkImageViewCreateInfo vi = {};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = ctx.overlay_image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(ctx.dev, &vi, nullptr, &ctx.overlay_view) != VK_SUCCESS) {
+        return false;
+    }
+
+    ctx.overlay_width = width;
+    ctx.overlay_height = height;
+    return true;
+}
+
+static bool ensure_descriptor_resources(Ctx& ctx) {
+    if (ctx.sampler == VK_NULL_HANDLE) {
+        VkSamplerCreateInfo si = {};
+        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter = VK_FILTER_LINEAR;
+        si.minFilter = VK_FILTER_LINEAR;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.maxAnisotropy = 1.0f;
+        if (vkCreateSampler(ctx.dev, &si, nullptr, &ctx.sampler) != VK_SUCCESS) {
+            return false;
+        }
+    }
+
+    if (ctx.desc_layout == VK_NULL_HANDLE) {
+        VkDescriptorSetLayoutBinding binding = {};
+        binding.binding = 0;
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.descriptorCount = 1;
+        binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo li = {};
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 1;
+        li.pBindings = &binding;
+        if (vkCreateDescriptorSetLayout(ctx.dev, &li, nullptr, &ctx.desc_layout) != VK_SUCCESS) {
+            return false;
+        }
+    }
+
+    if (ctx.desc_pool == VK_NULL_HANDLE) {
+        VkDescriptorPoolSize pool_size = {};
+        pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        pool_size.descriptorCount = 1;
+
+        VkDescriptorPoolCreateInfo pi = {};
+        pi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pi.maxSets = 1;
+        pi.poolSizeCount = 1;
+        pi.pPoolSizes = &pool_size;
+        if (vkCreateDescriptorPool(ctx.dev, &pi, nullptr, &ctx.desc_pool) != VK_SUCCESS) {
+            return false;
+        }
+    }
+
+    if (ctx.desc_set == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo ai = {};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = ctx.desc_pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &ctx.desc_layout;
+        if (vkAllocateDescriptorSets(ctx.dev, &ai, &ctx.desc_set) != VK_SUCCESS) {
+            return false;
+        }
+    }
+
+    if (ctx.pipeline_layout == VK_NULL_HANDLE) {
+        const VkPushConstantRange push_range = {
+            VK_SHADER_STAGE_VERTEX_BIT,
+            0,
+            sizeof(OverlayPushConstants)
+        };
+        VkPipelineLayoutCreateInfo pi = {};
+        pi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pi.setLayoutCount = 1;
+        pi.pSetLayouts = &ctx.desc_layout;
+        pi.pushConstantRangeCount = 1;
+        pi.pPushConstantRanges = &push_range;
+        if (vkCreatePipelineLayout(ctx.dev, &pi, nullptr, &ctx.pipeline_layout) != VK_SUCCESS) {
+            return false;
+        }
+    }
+
+    if (ctx.overlay_view != VK_NULL_HANDLE && ctx.desc_set != VK_NULL_HANDLE) {
+        VkDescriptorImageInfo image = {};
+        image.sampler = ctx.sampler;
+        image.imageView = ctx.overlay_view;
+        image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkWriteDescriptorSet write = {};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = ctx.desc_set;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &image;
+        vkUpdateDescriptorSets(ctx.dev, 1, &write, 0, nullptr);
+    }
+
+    return true;
+}
+
+static bool ensure_pipeline(Ctx& ctx, VkFormat target_format) {
+    if (ctx.pipeline != VK_NULL_HANDLE &&
+        ctx.render_pass != VK_NULL_HANDLE &&
+        ctx.fmt == target_format) {
+        return true;
+    }
+
+    destroy_target_views(ctx);
+    if (ctx.pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(ctx.dev, ctx.pipeline, nullptr);
+        ctx.pipeline = VK_NULL_HANDLE;
+    }
+    if (ctx.render_pass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(ctx.dev, ctx.render_pass, nullptr);
+        ctx.render_pass = VK_NULL_HANDLE;
+    }
+    ctx.fmt = target_format;
+
+    const auto vert_path = find_shader_path("overlay_quad.vert.spv");
+    const auto frag_path = find_shader_path("overlay_quad.frag.spv");
+    if (vert_path.empty() || frag_path.empty()) {
+        return false;
+    }
+
+    VkShaderModule vert = create_shader_module(ctx.dev, vert_path);
+    VkShaderModule frag = create_shader_module(ctx.dev, frag_path);
+    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+        if (vert != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(ctx.dev, vert, nullptr);
+        }
+        if (frag != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(ctx.dev, frag, nullptr);
+        }
+        return false;
+    }
+
+    VkAttachmentDescription attachment = {};
+    attachment.format = target_format;
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference color_ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_ref;
+
+    VkRenderPassCreateInfo rpi = {};
+    rpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpi.attachmentCount = 1;
+    rpi.pAttachments = &attachment;
+    rpi.subpassCount = 1;
+    rpi.pSubpasses = &subpass;
+    if (vkCreateRenderPass(ctx.dev, &rpi, nullptr, &ctx.render_pass) != VK_SUCCESS) {
+        vkDestroyShaderModule(ctx.dev, vert, nullptr);
+        vkDestroyShaderModule(ctx.dev, frag, nullptr);
+        return false;
+    }
+
+    if (!ensure_descriptor_resources(ctx)) {
+        vkDestroyShaderModule(ctx.dev, vert, nullptr);
+        vkDestroyShaderModule(ctx.dev, frag, nullptr);
+        return false;
+    }
+
+    const VkPipelineShaderStageCreateInfo stages[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+         VK_SHADER_STAGE_VERTEX_BIT, vert, "main", nullptr},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+         VK_SHADER_STAGE_FRAGMENT_BIT, frag, "main", nullptr},
+    };
+
+    VkPipelineVertexInputStateCreateInfo vertex_input = {};
+    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo input_assembly = {};
+    input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+
+    VkPipelineViewportStateCreateInfo viewport = {};
+    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport.viewportCount = 1;
+    viewport.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo raster = {};
+    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample = {};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState blend = {};
+    blend.blendEnable = VK_TRUE;
+    blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blend.colorBlendOp = VK_BLEND_OP_ADD;
+    blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blend.alphaBlendOp = VK_BLEND_OP_ADD;
+    blend.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo color_blend = {};
+    color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    color_blend.attachmentCount = 1;
+    color_blend.pAttachments = &blend;
+
+    const VkDynamicState dynamic_states[2] = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR,
+    };
+    VkPipelineDynamicStateCreateInfo dynamic = {};
+    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamic_states;
+
+    VkGraphicsPipelineCreateInfo gp = {};
+    gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.stageCount = 2;
+    gp.pStages = stages;
+    gp.pVertexInputState = &vertex_input;
+    gp.pInputAssemblyState = &input_assembly;
+    gp.pViewportState = &viewport;
+    gp.pRasterizationState = &raster;
+    gp.pMultisampleState = &multisample;
+    gp.pColorBlendState = &color_blend;
+    gp.pDynamicState = &dynamic;
+    gp.layout = ctx.pipeline_layout;
+    gp.renderPass = ctx.render_pass;
+    gp.subpass = 0;
+
+    const bool ok =
+        vkCreateGraphicsPipelines(ctx.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &ctx.pipeline) == VK_SUCCESS;
+    vkDestroyShaderModule(ctx.dev, vert, nullptr);
+    vkDestroyShaderModule(ctx.dev, frag, nullptr);
+    return ok;
+}
+
+static Ctx::TargetView* ensure_target_view(Ctx& ctx, VkImage target_image,
+                                           VkFormat format,
+                                           uint32_t width, uint32_t height)
+{
+    auto& target = ctx.target_views[target_image];
+    if (target.view != VK_NULL_HANDLE &&
+        target.framebuffer != VK_NULL_HANDLE &&
+        target.format == format &&
+        target.width == width &&
+        target.height == height) {
+        return &target;
+    }
+
+    if (target.framebuffer != VK_NULL_HANDLE) {
+        vkDestroyFramebuffer(ctx.dev, target.framebuffer, nullptr);
+        target.framebuffer = VK_NULL_HANDLE;
+    }
+    if (target.view != VK_NULL_HANDLE) {
+        vkDestroyImageView(ctx.dev, target.view, nullptr);
+        target.view = VK_NULL_HANDLE;
+    }
+
+    VkImageViewCreateInfo vi = {};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = target_image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = format;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(ctx.dev, &vi, nullptr, &target.view) != VK_SUCCESS) {
+        return nullptr;
+    }
+
+    VkFramebufferCreateInfo fi = {};
+    fi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fi.renderPass = ctx.render_pass;
+    fi.attachmentCount = 1;
+    fi.pAttachments = &target.view;
+    fi.width = width;
+    fi.height = height;
+    fi.layers = 1;
+    if (vkCreateFramebuffer(ctx.dev, &fi, nullptr, &target.framebuffer) != VK_SUCCESS) {
+        vkDestroyImageView(ctx.dev, target.view, nullptr);
+        target.view = VK_NULL_HANDLE;
+        return nullptr;
+    }
+
+    target.width = width;
+    target.height = height;
+    target.format = format;
+    return &target;
 }
 
 /* ---- Panel rendering ---- */
@@ -1120,35 +1639,49 @@ static void build_panel(const SigawState& vs, const sigaw::Config& cfg,
     }
 }
 
-static sigaw::preview::Placement panel_placement(const sigaw::Config& cfg,
+static sigaw::preview::Placement panel_placement(sigaw::OverlayPosition position,
+                                                 uint32_t margin,
                                                  uint32_t panel_w, uint32_t panel_h,
                                                  uint32_t screen_w, uint32_t screen_h)
 {
-    const int margin = sigaw::overlay::scaled_px(cfg.scale, 16);
     int x = 0;
     int y = 0;
-    switch (cfg.position) {
+    switch (position) {
         case sigaw::OverlayPosition::TopLeft:
-            x = margin;
-            y = margin;
+            x = static_cast<int>(margin);
+            y = static_cast<int>(margin);
             break;
         case sigaw::OverlayPosition::TopRight:
-            x = static_cast<int>(screen_w) - static_cast<int>(panel_w) - margin;
-            y = margin;
+            x = static_cast<int>(screen_w) - static_cast<int>(panel_w) - static_cast<int>(margin);
+            y = static_cast<int>(margin);
             break;
         case sigaw::OverlayPosition::BottomLeft:
-            x = margin;
-            y = static_cast<int>(screen_h) - static_cast<int>(panel_h) - margin;
+            x = static_cast<int>(margin);
+            y = static_cast<int>(screen_h) - static_cast<int>(panel_h) - static_cast<int>(margin);
             break;
         case sigaw::OverlayPosition::BottomRight:
-            x = static_cast<int>(screen_w) - static_cast<int>(panel_w) - margin;
-            y = static_cast<int>(screen_h) - static_cast<int>(panel_h) - margin;
+            x = static_cast<int>(screen_w) - static_cast<int>(panel_w) - static_cast<int>(margin);
+            y = static_cast<int>(screen_h) - static_cast<int>(panel_h) - static_cast<int>(margin);
             break;
     }
 
     x = std::max(0, std::min(x, static_cast<int>(screen_w) - static_cast<int>(panel_w)));
     y = std::max(0, std::min(y, static_cast<int>(screen_h) - static_cast<int>(panel_h)));
     return {x, y};
+}
+
+static sigaw::preview::Placement panel_placement(const sigaw::Config& cfg,
+                                                 uint32_t panel_w, uint32_t panel_h,
+                                                 uint32_t screen_w, uint32_t screen_h)
+{
+    return panel_placement(
+        cfg.position,
+        static_cast<uint32_t>(sigaw::overlay::scaled_px(cfg.scale, 16)),
+        panel_w,
+        panel_h,
+        screen_w,
+        screen_h
+    );
 }
 
 static bool render_panel_rgba_internal(const SigawState& state, const sigaw::Config& cfg,
@@ -1233,121 +1766,49 @@ bool write_png(const std::filesystem::path& path, const Image& image)
 namespace sigaw::overlay {
 
 struct Runtime::Impl {
-    sigaw::ShmReader shm;
-    sigaw::Config cfg;
-    sigaw::ConfigWatcher cfg_watch;
-    PBuf panel;
-    TextSystem text;
-    AvatarStore avatars;
-    std::unordered_map<uint64_t, float> speaking_times_ms;
-    std::chrono::steady_clock::time_point last_speaking_tick = {};
+    sigaw::OverlayFrameReader frame_reader;
+    sigaw::OverlayFrameSnapshot frame;
+    bool have_frame = false;
     bool debug = std::getenv("SIGAW_DEBUG") != nullptr;
-
-    void refresh_config(bool force = false) {
-        if (force) {
-            cfg = sigaw::Config::load();
-            cfg_watch.sync();
-            return;
-        }
-
-        if (cfg_watch.consume_change()) {
-            cfg = sigaw::Config::load();
-        }
-    }
-
-    void reset_speaking_animation() {
-        speaking_times_ms.clear();
-        last_speaking_tick = {};
-    }
-
-    float speaking_frame_delta_ms(std::chrono::steady_clock::time_point now) {
-        float dt_ms = 0.0f;
-        if (last_speaking_tick != std::chrono::steady_clock::time_point{}) {
-            dt_ms = std::chrono::duration<float, std::milli>(now - last_speaking_tick).count();
-        }
-        last_speaking_tick = now;
-        return std::clamp(dt_ms, 0.0f, sigaw::overlay::speaking_fade_ms);
-    }
-
-    void update_speaking_animation(const SigawState& vs, float dt_ms) {
-        for (uint32_t i = 0; i < vs.user_count; ++i) {
-            const auto& user = vs.users[i];
-            auto& progress_ms = speaking_times_ms[user.user_id];
-            progress_ms = sigaw::overlay::advance_speaking_time(progress_ms, user.speaking != 0, dt_ms);
-        }
-
-        for (auto it = speaking_times_ms.begin(); it != speaking_times_ms.end(); ) {
-            bool present = false;
-            for (uint32_t i = 0; i < vs.user_count; ++i) {
-                if (vs.users[i].user_id == it->first) {
-                    present = true;
-                    break;
-                }
-            }
-
-            if (!present) {
-                it = speaking_times_ms.erase(it);
-                continue;
-            }
-
-            ++it;
-        }
-    }
 
     PreparedFrame prepare(uint32_t surface_width, uint32_t surface_height) {
         PreparedFrame out;
-
-        refresh_config();
-        if (!cfg.visible || surface_width == 0 || surface_height == 0) {
+        if (surface_width == 0 || surface_height == 0) {
             return out;
         }
 
-        SigawState vs = {};
-        const bool have_voice_state = shm.read(vs);
-        if (debug && !have_voice_state) {
-            fprintf(stderr, "[sigaw] Debug: shared memory read unavailable, rendering fallback panel\n");
-        }
-
-        if (have_voice_state) {
-            const auto now = std::chrono::steady_clock::now();
-            update_speaking_animation(vs, speaking_frame_delta_ms(now));
-        } else if (!shm.is_connected()) {
-            reset_speaking_animation();
-        }
-
-        build_panel(vs, cfg, panel, text, avatars, speaking_times_ms);
-        if (panel.p.empty() || panel.w == 0 || panel.h == 0) {
-            return out;
-        }
-
-        const auto placement = panel_placement(cfg, panel.w, panel.h, surface_width, surface_height);
-        const uint32_t crop_w = std::min(panel.w, surface_width - static_cast<uint32_t>(placement.x));
-        const uint32_t crop_h = std::min(panel.h, surface_height - static_cast<uint32_t>(placement.y));
-        if (crop_w == 0 || crop_h == 0) {
-            return out;
-        }
-
-        out.placement = placement;
-        out.image.width = crop_w;
-        out.image.height = crop_h;
-        out.image.rgba.resize(static_cast<size_t>(crop_w) * crop_h * 4u);
-        for (uint32_t y = 0; y < crop_h; ++y) {
-            for (uint32_t x = 0; x < crop_w; ++x) {
-                const auto& src = panel.p[static_cast<size_t>(y) * panel.w + x];
-                const size_t idx = (static_cast<size_t>(y) * crop_w + x) * 4u;
-                out.image.rgba[idx + 0] = src.r;
-                out.image.rgba[idx + 1] = src.g;
-                out.image.rgba[idx + 2] = src.b;
-                out.image.rgba[idx + 3] = src.a;
+        bool changed = false;
+        const bool available = frame_reader.read(frame, &changed);
+        if (!available) {
+            if (!frame_reader.is_connected()) {
+                have_frame = false;
+                frame = {};
             }
+            if (debug) {
+                fprintf(stderr, "[sigaw] Debug: overlay frame unavailable\n");
+            }
+            return out;
         }
+
+        have_frame = true;
+        if (!frame.visible || frame.width == 0 || frame.height == 0 || frame.rgba.empty()) {
+            return out;
+        }
+
+        out.placement = panel_placement(
+            frame.position, frame.margin_px, frame.width, frame.height, surface_width, surface_height
+        );
+        out.rgba = frame.rgba.data();
+        out.width = frame.width;
+        out.height = frame.height;
+        out.byte_size = frame.rgba.size();
+        out.sequence = frame.sequence;
+        out.changed = changed;
         return out;
     }
 };
 
-Runtime::Runtime() : impl_(std::make_unique<Impl>()) {
-    impl_->refresh_config(true);
-}
+Runtime::Runtime() : impl_(std::make_unique<Impl>()) {}
 
 Runtime::~Runtime() = default;
 
@@ -1365,29 +1826,6 @@ bool Runtime::debug_enabled() const {
 
 } /* namespace sigaw::overlay */
 
-static void composite_image_over(void* dst, VkFormat fmt, const sigaw::preview::Image& image)
-{
-    auto* out = static_cast<uint8_t*>(dst);
-    for (uint32_t y = 0; y < image.height; ++y) {
-        for (uint32_t x = 0; x < image.width; ++x) {
-            const size_t idx = (static_cast<size_t>(y) * image.width + x) * 4u;
-            const RGBA src = {
-                image.rgba[idx + 0],
-                image.rgba[idx + 1],
-                image.rgba[idx + 2],
-                image.rgba[idx + 3],
-            };
-            if (src.a == 0) {
-                continue;
-            }
-
-            uint8_t* px = out + idx;
-            const RGBA dst_px = PBuf::load_pixel(px, fmt);
-            PBuf::store_pixel(px, fmt, alpha_blend(dst_px, src));
-        }
-    }
-}
-
 /* ======================================================================== */
 /*  C API                                                                    */
 /* ======================================================================== */
@@ -1401,23 +1839,51 @@ static void destroy_overlay_context(Ctx* ctx, bool wait_idle)
     if (wait_idle && ctx->dev != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(ctx->dev);
     }
-    if (ctx->sptr) {
+
+    destroy_target_views(*ctx);
+
+    if (ctx->pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(ctx->dev, ctx->pipeline, nullptr);
+        ctx->pipeline = VK_NULL_HANDLE;
+    }
+    if (ctx->render_pass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(ctx->dev, ctx->render_pass, nullptr);
+        ctx->render_pass = VK_NULL_HANDLE;
+    }
+    if (ctx->pipeline_layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(ctx->dev, ctx->pipeline_layout, nullptr);
+        ctx->pipeline_layout = VK_NULL_HANDLE;
+    }
+    if (ctx->desc_pool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(ctx->dev, ctx->desc_pool, nullptr);
+        ctx->desc_pool = VK_NULL_HANDLE;
+    }
+    if (ctx->desc_layout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(ctx->dev, ctx->desc_layout, nullptr);
+        ctx->desc_layout = VK_NULL_HANDLE;
+    }
+    if (ctx->sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(ctx->dev, ctx->sampler, nullptr);
+        ctx->sampler = VK_NULL_HANDLE;
+    }
+    destroy_overlay_texture(*ctx);
+    if (ctx->sptr != nullptr) {
         vkUnmapMemory(ctx->dev, ctx->smem);
         ctx->sptr = nullptr;
     }
-    if (ctx->sbuf) {
+    if (ctx->sbuf != VK_NULL_HANDLE) {
         vkDestroyBuffer(ctx->dev, ctx->sbuf, nullptr);
         ctx->sbuf = VK_NULL_HANDLE;
     }
-    if (ctx->smem) {
+    if (ctx->smem != VK_NULL_HANDLE) {
         vkFreeMemory(ctx->dev, ctx->smem, nullptr);
         ctx->smem = VK_NULL_HANDLE;
     }
-    if (ctx->fen) {
+    if (ctx->fen != VK_NULL_HANDLE) {
         vkDestroyFence(ctx->dev, ctx->fen, nullptr);
         ctx->fen = VK_NULL_HANDLE;
     }
-    if (ctx->pool) {
+    if (ctx->pool != VK_NULL_HANDLE) {
         vkDestroyCommandPool(ctx->dev, ctx->pool, nullptr);
         ctx->pool = VK_NULL_HANDLE;
     }
@@ -1448,43 +1914,37 @@ SigawOverlayContext* sigaw_overlay_create(VkDevice device, VkPhysicalDevice phys
     pi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pi.queueFamilyIndex = queue_family;
     pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    vkCreateCommandPool(device, &pi, nullptr, &c.pool);
+    if (vkCreateCommandPool(device, &pi, nullptr, &c.pool) != VK_SUCCESS) {
+        destroy_overlay_context(ctx, false);
+        delete ctx;
+        return nullptr;
+    }
 
     VkCommandBufferAllocateInfo ai = {};
     ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     ai.commandPool = c.pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ai.commandBufferCount = 1;
-    vkAllocateCommandBuffers(device, &ai, &c.cmd);
-
-    VkFenceCreateInfo fi = {};
-    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    vkCreateFence(device, &fi, nullptr, &c.fen);
-
-    c.ssz = 2 * 1024 * 1024; /* 2MB staging */
-    VkBufferCreateInfo bi = {};
-    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bi.size = c.ssz;
-    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    vkCreateBuffer(device, &bi, nullptr, &c.sbuf);
-
-    VkMemoryRequirements mr;
-    vkGetBufferMemoryRequirements(device, c.sbuf, &mr);
-    VkMemoryAllocateInfo ma = {};
-    ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    ma.allocationSize = mr.size;
-    ma.memoryTypeIndex = find_mem(c, phys_device, mr.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (ma.memoryTypeIndex == UINT32_MAX) {
-        fprintf(stderr, "[sigaw] Failed to find host-visible memory type for overlay staging buffer\n");
+    if (vkAllocateCommandBuffers(device, &ai, &c.cmd) != VK_SUCCESS) {
         destroy_overlay_context(ctx, false);
         delete ctx;
         return nullptr;
     }
-    vkAllocateMemory(device, &ma, nullptr, &c.smem);
-    vkBindBufferMemory(device, c.sbuf, c.smem, 0);
-    vkMapMemory(device, c.smem, 0, c.ssz, 0, &c.sptr);
+
+    VkFenceCreateInfo fi = {};
+    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    if (vkCreateFence(device, &fi, nullptr, &c.fen) != VK_SUCCESS) {
+        destroy_overlay_context(ctx, false);
+        delete ctx;
+        return nullptr;
+    }
+
+    if (!ensure_staging_capacity(c, 2 * 1024 * 1024) ||
+        !ensure_descriptor_resources(c)) {
+        destroy_overlay_context(ctx, false);
+        delete ctx;
+        return nullptr;
+    }
 
     c.ok = true;
     fprintf(stderr, "[sigaw] Overlay initialized (%ux%u fmt=%d)\n", width, height, format);
@@ -1509,7 +1969,10 @@ void sigaw_overlay_resize(SigawOverlayContext* handle, VkFormat format,
         return;
     }
 
-    ctx->fmt = format;
+    if (ctx->fmt != format) {
+        ctx->fmt = format;
+        destroy_target_views(*ctx);
+    }
     ctx->sw = width;
     ctx->sh = height;
 }
@@ -1530,7 +1993,7 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
     auto& c = *ctx;
     if (!c.ok) return 0;
 
-    if (!supports_staging_copy_format(format)) {
+    if (!supports_overlay_format(format)) {
         static VkFormat logged_format = VK_FORMAT_UNDEFINED;
         if (logged_format != format) {
             fprintf(stderr,
@@ -1546,10 +2009,31 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
 
     const int px = frame.placement.x;
     const int py = frame.placement.y;
-    const uint32_t cw = frame.image.width;
-    const uint32_t ch = frame.image.height;
-    const size_t bytes = frame.image.rgba.size();
-    if (bytes > (size_t)c.ssz) return 0;
+    const uint32_t cw = frame.width;
+    const uint32_t ch = frame.height;
+    const size_t bytes = frame.byte_size;
+    const bool needs_upload =
+        frame.changed ||
+        c.uploaded_sequence != frame.sequence ||
+        c.overlay_width != cw ||
+        c.overlay_height != ch;
+
+    if (needs_upload) {
+        if (!ensure_staging_capacity(c, bytes) ||
+            !ensure_overlay_texture(c, cw, ch) ||
+            !ensure_descriptor_resources(c)) {
+            return 0;
+        }
+        std::memcpy(c.sptr, frame.rgba, bytes);
+    }
+
+    if (!ensure_pipeline(c, format)) {
+        return 0;
+    }
+    auto* target = ensure_target_view(c, target_image, format, width, height);
+    if (target == nullptr) {
+        return 0;
+    }
 
     if (c.runtime.debug_enabled() && !c.logged_first_render) {
         fprintf(stderr,
@@ -1567,81 +2051,157 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
     beg.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(c.cmd, &beg);
 
-    VkImageMemoryBarrier bar = {};
-    bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    bar.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    bar.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    bar.image = target_image;
-    bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+    if (needs_upload) {
+        VkImageMemoryBarrier texture_barrier = {};
+        texture_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        texture_barrier.srcAccessMask = c.overlay_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+            ? static_cast<VkAccessFlags>(VK_ACCESS_SHADER_READ_BIT)
+            : static_cast<VkAccessFlags>(0u);
+        texture_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        texture_barrier.oldLayout = c.overlay_layout;
+        texture_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        texture_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        texture_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        texture_barrier.image = c.overlay_image;
+        texture_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(
+            c.cmd,
+            c.overlay_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &texture_barrier
+        );
 
-    VkBufferImageCopy reg = {};
-    reg.bufferRowLength = cw; reg.bufferImageHeight = ch;
-    reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    reg.imageOffset = {px, py, 0};
-    reg.imageExtent = {cw, ch, 1};
-    vkCmdCopyImageToBuffer(c.cmd, target_image,
-                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c.sbuf, 1, &reg);
+        VkBufferImageCopy upload = {};
+        upload.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        upload.imageExtent = {cw, ch, 1};
+        vkCmdCopyBufferToImage(
+            c.cmd,
+            c.sbuf,
+            c.overlay_image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &upload
+        );
+
+        texture_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        texture_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        texture_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        texture_barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier(
+            c.cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &texture_barrier
+        );
+        c.overlay_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
+    VkImageMemoryBarrier target_barrier = {};
+    target_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    target_barrier.srcAccessMask = 0;
+    target_barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    target_barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    target_barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    target_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    target_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    target_barrier.image = target_image;
+    target_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(
+        c.cmd,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        0,
+        0, nullptr,
+        0, nullptr,
+        1, &target_barrier
+    );
+
+    VkRenderPassBeginInfo rp = {};
+    rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp.renderPass = c.render_pass;
+    rp.framebuffer = target->framebuffer;
+    rp.renderArea.extent = {width, height};
+    vkCmdBeginRenderPass(c.cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport viewport = {};
+    viewport.width = static_cast<float>(width);
+    viewport.height = static_cast<float>(height);
+    viewport.maxDepth = 1.0f;
+    VkRect2D scissor = {{0, 0}, {width, height}};
+    vkCmdSetViewport(c.cmd, 0, 1, &viewport);
+    vkCmdSetScissor(c.cmd, 0, 1, &scissor);
+    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c.pipeline);
+    vkCmdBindDescriptorSets(
+        c.cmd,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        c.pipeline_layout,
+        0,
+        1,
+        &c.desc_set,
+        0,
+        nullptr
+    );
+
+    const OverlayPushConstants push = {
+        {static_cast<float>(width), static_cast<float>(height)},
+        {static_cast<float>(px), static_cast<float>(py),
+         static_cast<float>(cw), static_cast<float>(ch)}
+    };
+    vkCmdPushConstants(
+        c.cmd,
+        c.pipeline_layout,
+        VK_SHADER_STAGE_VERTEX_BIT,
+        0,
+        sizeof(push),
+        &push
+    );
+    vkCmdDraw(c.cmd, 4, 1, 0, 0);
+    vkCmdEndRenderPass(c.cmd);
+
+    target_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    target_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    target_barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    target_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    vkCmdPipelineBarrier(
+        c.cmd,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0,
+        0, nullptr,
+        0, nullptr,
+        1, &target_barrier
+    );
 
     vkEndCommandBuffer(c.cmd);
 
     VkSubmitInfo sub = {};
     sub.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    sub.commandBufferCount = 1; sub.pCommandBuffers = &c.cmd;
+    sub.commandBufferCount = 1;
+    sub.pCommandBuffers = &c.cmd;
     VkPipelineStageFlags wait_stages[8] = {};
     if (wait_sem_count > 8) wait_sem_count = 8;
     for (uint32_t i = 0; i < wait_sem_count; ++i) {
-        wait_stages[i] = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        wait_stages[i] = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     }
-    if (wait_sem_count && wait_sems) {
+    if (wait_sem_count != 0 && wait_sems != nullptr) {
         sub.waitSemaphoreCount = wait_sem_count;
         sub.pWaitSemaphores = wait_sems;
         sub.pWaitDstStageMask = wait_stages;
     }
-    if (vkQueueSubmit(queue, 1, &sub, c.fen) != VK_SUCCESS) {
-        return 0;
-    }
-
-    vkWaitForFences(c.dev, 1, &c.fen, VK_TRUE, UINT64_MAX);
-    composite_image_over(c.sptr, format, frame.image);
-
-    vkResetFences(c.dev, 1, &c.fen);
-    vkResetCommandBuffer(c.cmd, 0);
-
-    vkBeginCommandBuffer(c.cmd, &beg);
-
-    bar.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
-
-    vkCmdCopyBufferToImage(c.cmd, c.sbuf, target_image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
-
-    bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    bar.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    bar.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
-
-    vkEndCommandBuffer(c.cmd);
-
-    sub.waitSemaphoreCount = 0;
-    sub.pWaitSemaphores = nullptr;
-    sub.pWaitDstStageMask = nullptr;
     if (signal_sem) { sub.signalSemaphoreCount = 1; sub.pSignalSemaphores = &signal_sem; }
     else { sub.signalSemaphoreCount = 0; sub.pSignalSemaphores = nullptr; }
     if (vkQueueSubmit(queue, 1, &sub, c.fen) != VK_SUCCESS) {
         return 0;
     }
+    c.uploaded_sequence = frame.sequence;
     if (!signal_sem) {
         vkWaitForFences(c.dev, 1, &c.fen, VK_TRUE, UINT64_MAX);
     }

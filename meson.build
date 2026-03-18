@@ -63,6 +63,27 @@ curl_dep = dependency('libcurl', required: true)
 # Layer text/image rendering
 freetype_dep = dependency('freetype2', required: true)
 png_dep = dependency('libpng', required: true)
+glslang_validator = find_program('glslangValidator', required: true)
+
+overlay_quad_vert_spv = custom_target(
+  'overlay-quad-vert-spv',
+  input: 'src/layer/shaders/overlay_quad.vert',
+  output: 'overlay_quad.vert.spv',
+  command: [glslang_validator, '-V', '-S', 'vert', '-o', '@OUTPUT@', '@INPUT@'],
+  build_by_default: true,
+  install: true,
+  install_dir: get_option('datadir') / 'sigaw' / 'shaders',
+)
+
+overlay_quad_frag_spv = custom_target(
+  'overlay-quad-frag-spv',
+  input: 'src/layer/shaders/overlay_quad.frag',
+  output: 'overlay_quad.frag.spv',
+  command: [glslang_validator, '-V', '-S', 'frag', '-o', '@OUTPUT@', '@INPUT@'],
+  build_by_default: true,
+  install: true,
+  install_dir: get_option('datadir') / 'sigaw' / 'shaders',
+)
 
 # --------------------------------------------------------------------------
 # Vulkan Layer (libSigaw.so)
@@ -74,6 +95,7 @@ layer_sources = [
 ]
 
 overlay_cpp_args = [
+  '-DSIGAW_BUILD_DIR="' + meson.current_build_dir() + '"',
   '-DSIGAW_DATA_DIR="' + (datadir_abs / 'sigaw') + '"',
   '-DSIGAW_SOURCE_DIR="' + meson.current_source_dir() + '"',
 ]
@@ -176,15 +198,17 @@ install_data(
 
 daemon_sources = [
   'src/daemon/main.cpp',
+  'src/layer/overlay_renderer.cpp',
 ]
 
-daemon_deps = [rt_dep, thread_dep, json_dep, curl_dep]
+daemon_deps = [vulkan_dep, rt_dep, thread_dep, json_dep, curl_dep, freetype_dep, png_dep]
 
 daemon_bin = executable(
   'sigaw-daemon',
   daemon_sources,
   include_directories: include_directories('src'),
   dependencies: daemon_deps,
+  cpp_args: overlay_cpp_args,
   install: true,
 )
 
@@ -313,6 +337,17 @@ overlay_animation_test = executable(
 test(
   'sigaw-overlay-animation',
   overlay_animation_test,
+)
+
+overlay_frame_metadata_test = executable(
+  'sigaw-overlay-frame-metadata-test',
+  'tests/overlay_frame_metadata_test.cpp',
+  include_directories: include_directories('src'),
+)
+
+test(
+  'sigaw-overlay-frame-metadata',
+  overlay_frame_metadata_test,
 )
 
 overlay_panel_test = executable(

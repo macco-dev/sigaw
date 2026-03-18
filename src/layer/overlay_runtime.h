@@ -1,6 +1,7 @@
 #ifndef SIGAW_OVERLAY_RUNTIME_H
 #define SIGAW_OVERLAY_RUNTIME_H
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -9,11 +10,16 @@
 namespace sigaw::overlay {
 
 struct PreparedFrame {
-    sigaw::preview::Image image;
+    const uint8_t* rgba = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    size_t byte_size = 0;
     sigaw::preview::Placement placement;
+    uint64_t sequence = 0;
+    bool changed = false;
 
     bool empty() const {
-        return image.width == 0 || image.height == 0 || image.rgba.empty();
+        return rgba == nullptr || width == 0 || height == 0 || byte_size == 0;
     }
 };
 

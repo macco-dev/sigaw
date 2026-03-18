@@ -14,7 +14,8 @@ extern "C" {
 #endif
 
 #define SIGAW_MAGIC        0x53494741  /* "SIGA" */
-#define SIGAW_VERSION      2
+#define SIGAW_OVERLAY_MAGIC 0x5349474f /* "SIGO" */
+#define SIGAW_VERSION      3
 #define SIGAW_MAX_USERS    64
 #define SIGAW_SHM_SIZE     sizeof(struct SigawState)
 
@@ -68,6 +69,36 @@ struct SigawState {
     uint32_t _pad;
     struct SigawUser users[SIGAW_MAX_USERS];
 };
+
+enum SigawOverlayAnchor {
+    SIGAW_OVERLAY_ANCHOR_TOP_LEFT = 0,
+    SIGAW_OVERLAY_ANCHOR_TOP_RIGHT = 1,
+    SIGAW_OVERLAY_ANCHOR_BOTTOM_LEFT = 2,
+    SIGAW_OVERLAY_ANCHOR_BOTTOM_RIGHT = 3,
+};
+
+/*
+ * Overlay frame header for the daemon-rendered panel.
+ * Pixels are premultiplied RGBA8 and stored immediately after the header.
+ */
+struct __attribute__((aligned(64))) SigawOverlayFrameHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t sequence;
+    uint32_t visible;
+    uint32_t anchor;
+    uint32_t margin_px;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t byte_size;
+    uint32_t _pad[5];
+};
+
+SIGAW_STATIC_ASSERT(
+    sizeof(struct SigawOverlayFrameHeader) == 64,
+    "SigawOverlayFrameHeader must be 64 bytes"
+);
 
 /* Control commands (daemon <-> ctl via Unix socket) */
 enum SigawCtlCommand {

@@ -7,7 +7,9 @@
 #include <getopt.h>
 #include <algorithm>
 #include <chrono>
+#include <poll.h>
 #include <thread>
+#include <unordered_map>
 
 #include "avatar_cache.h"
 #include "control_server.h"
@@ -17,7 +19,11 @@
 #include "voice_runtime.h"
 #include "../common/config.h"
 #include "../common/config_watcher.h"
+#include "../common/overlay_frame_shm.h"
 #include "../common/protocol.h"
+#include "../layer/overlay_animation.h"
+#include "../layer/overlay_layout.h"
+#include "../layer/overlay_preview.h"
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -121,6 +127,92 @@ static void update_shm(sigaw::ShmWriter& shm,
     shm.end_write();
 }
 
+static SigawState make_overlay_state(const sigaw::VoiceState& voice) {
+    SigawState state = {};
+    if (voice.channel_id.empty()) {
+        return state;
+    }
+
+    const size_t channel_len = std::min(
+        voice.channel_name.size(),
+        sizeof(state.header.channel_name) - 1
+    );
+    std::memcpy(state.header.channel_name, voice.channel_name.data(), channel_len);
+    state.header.channel_name[channel_len] = '\0';
+    state.header.channel_name_len = static_cast<uint32_t>(channel_len);
+
+    const uint32_t count = std::min(
+        static_cast<uint32_t>(voice.users.size()),
+        static_cast<uint32_t>(SIGAW_MAX_USERS)
+    );
+    state.user_count = count;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& src = voice.users[i];
+        auto& dst = state.users[i];
+        dst.user_id = src.id;
+        std::strncpy(dst.username, src.username.c_str(), sizeof(dst.username) - 1);
+        dst.username[sizeof(dst.username) - 1] = '\0';
+        std::strncpy(dst.avatar_hash, src.avatar.c_str(), sizeof(dst.avatar_hash) - 1);
+        dst.avatar_hash[sizeof(dst.avatar_hash) - 1] = '\0';
+        dst.speaking = src.speaking ? 1u : 0u;
+        dst.self_mute = src.self_mute ? 1u : 0u;
+        dst.self_deaf = src.self_deaf ? 1u : 0u;
+        dst.server_mute = src.server_mute ? 1u : 0u;
+        dst.server_deaf = src.server_deaf ? 1u : 0u;
+        dst.suppress = 0u;
+    }
+
+    return state;
+}
+
+static std::unordered_map<uint64_t, float>
+speaking_overlay_times(const sigaw::VoiceState& voice)
+{
+    std::unordered_map<uint64_t, float> times;
+    for (const auto& user : voice.users) {
+        if (user.speaking) {
+            times[user.id] = sigaw::overlay::speaking_fade_ms;
+        }
+    }
+    return times;
+}
+
+static sigaw::OverlayFrameSnapshot
+build_overlay_frame(const sigaw::VoiceState& voice, const sigaw::Config& config)
+{
+    sigaw::OverlayFrameSnapshot frame;
+    frame.position = config.position;
+    frame.margin_px = static_cast<uint32_t>(sigaw::overlay::scaled_px(config.scale, 16));
+    if (!config.visible || voice.channel_id.empty()) {
+        return frame;
+    }
+
+    const SigawState state = make_overlay_state(voice);
+    sigaw::preview::Image image;
+    if (!sigaw::preview::render_panel_rgba(
+            state, config, speaking_overlay_times(voice), image
+        )) {
+        return frame;
+    }
+
+    frame.visible = image.width != 0 && image.height != 0 && !image.rgba.empty();
+    frame.width = image.width;
+    frame.height = image.height;
+    frame.stride = image.width * 4u;
+    frame.rgba = std::move(image.rgba);
+    return frame;
+}
+
+static void publish_overlay_frame(sigaw::OverlayFrameWriter& writer,
+                                  const sigaw::VoiceState& voice,
+                                  const sigaw::Config& config)
+{
+    if (!writer.publish(build_overlay_frame(voice, config))) {
+        fprintf(stderr, "[sigaw] Failed to publish overlay frame\n");
+    }
+}
+
 int main(int argc, char** argv) {
     bool foreground = true;
     bool init_config = false;
@@ -204,6 +296,7 @@ int main(int argc, char** argv) {
 
     {
         sigaw::AvatarCache avatar_cache;
+        sigaw::OverlayFrameWriter overlay_frame;
         const sigaw::VoiceSyncConfig sync_config{};
 
         /* Main reconnection loop */
@@ -259,17 +352,47 @@ int main(int argc, char** argv) {
             }
 
             update_shm(shm, runtime.voice, avatar_cache);
+            publish_overlay_frame(overlay_frame, runtime.voice, config);
 
             /* Event loop */
             fprintf(stderr, "[sigaw] Listening for voice events...\n");
 
             bool reconnect_requested = false;
             while (g_running && ipc.is_connected()) {
-                json event = ipc.poll_event();
                 bool state_changed = false;
+                bool overlay_dirty = false;
+                bool closed = false;
 
-                if (!event.is_null() && !event.empty()) {
-                    if (event.contains("_closed")) break;
+                int timeout_ms = 250;
+                if (runtime.pending_sync.active()) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        runtime.pending_sync.next_attempt - now
+                    ).count();
+                    timeout_ms = std::clamp(static_cast<int>(delay), 0, timeout_ms);
+                }
+
+                struct pollfd fds[2] = {};
+                nfds_t fd_count = 0;
+                if (ipc.fd() >= 0) {
+                    fds[fd_count++] = {ipc.fd(), POLLIN, 0};
+                }
+                if (ctl.fd() >= 0) {
+                    fds[fd_count++] = {ctl.fd(), POLLIN, 0};
+                }
+                if (fd_count > 0) {
+                    (void)::poll(fds, fd_count, timeout_ms);
+                }
+
+                while (true) {
+                    json event = ipc.poll_event(0);
+                    if (event.is_null() || event.empty()) {
+                        break;
+                    }
+                    if (event.contains("_closed")) {
+                        closed = true;
+                        break;
+                    }
 
                     try {
                         const auto update = sigaw::process_voice_event(
@@ -284,11 +407,15 @@ int main(int argc, char** argv) {
                         if (!update.user_left.empty()) {
                             fprintf(stderr, "[sigaw] - %s\n", update.user_left.c_str());
                         }
-                        state_changed = update.state_changed;
+                        state_changed = state_changed || update.state_changed;
                     } catch (const std::exception& e) {
                         fprintf(stderr, "[sigaw] Ignoring malformed Discord event: %s\n",
                                 e.what());
                     }
+                }
+
+                if (closed) {
+                    break;
                 }
 
                 const auto sync_update = sigaw::sync_pending_channel(
@@ -302,15 +429,18 @@ int main(int argc, char** argv) {
 
                 if (state_changed) {
                     update_shm(shm, runtime.voice, avatar_cache);
+                    overlay_dirty = true;
                 }
 
                 if (config_watcher.consume_change()) {
+                    const auto current = config;
                     const auto updated = sigaw::Config::load();
-                    reconnect_requested = daemon_requires_reconnect(config, updated);
+                    reconnect_requested = daemon_requires_reconnect(current, updated);
                     config = updated;
                     if (reconnect_requested) {
                         break;
                     }
+                    overlay_dirty = true;
                 }
 
                 const auto action = ctl.process_pending(config);
@@ -318,14 +448,21 @@ int main(int argc, char** argv) {
                     g_running = 0;
                     break;
                 }
+                if (action == sigaw::ControlServer::Action::Refresh) {
+                    overlay_dirty = true;
+                }
                 if (action == sigaw::ControlServer::Action::Reload) {
                     reconnect_requested = true;
                     break;
                 }
 
-                /* ~16ms poll interval (60Hz) -- low CPU, fast enough for
-                 * speaking indicators to feel responsive */
-                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                if (avatar_cache.consume_dirty()) {
+                    overlay_dirty = true;
+                }
+
+                if (overlay_dirty) {
+                    publish_overlay_frame(overlay_frame, runtime.voice, config);
+                }
             }
 
             fprintf(stderr, "[sigaw] Disconnected, reconnecting...\n");
@@ -333,6 +470,7 @@ int main(int argc, char** argv) {
             /* Clear voice state on disconnect */
             runtime = {};
             update_shm(shm, runtime.voice, avatar_cache);
+            publish_overlay_frame(overlay_frame, runtime.voice, config);
 
             if (!g_running) {
                 break;

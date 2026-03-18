@@ -2,6 +2,7 @@
 #define SIGAW_AVATAR_CACHE_H
 
 #include <condition_variable>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -68,6 +69,10 @@ public:
             jobs_.push_back(Job{user_id, avatar_hash, path});
         }
         cv_.notify_one();
+    }
+
+    bool consume_dirty() {
+        return dirty_.exchange(false);
     }
 
 private:
@@ -183,6 +188,7 @@ private:
             std::filesystem::perm_options::replace,
             ec
         );
+        dirty_.store(true);
     }
 
     std::filesystem::path        root_;
@@ -191,6 +197,7 @@ private:
     std::deque<Job>              jobs_;
     std::unordered_set<std::string> queued_;
     std::thread                  worker_;
+    std::atomic<bool>            dirty_ = false;
     bool                         stop_ = false;
 };
 

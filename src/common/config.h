@@ -242,6 +242,16 @@ struct Config {
                std::to_string(static_cast<unsigned long long>(::getuid()));
     }
 
+    static std::string overlay_frame_memory_name() {
+        const char* env_override = std::getenv("SIGAW_FRAME_SHM_NAME");
+        if (env_override && *env_override) {
+            return env_override;
+        }
+
+        return "/sigaw-overlay-" +
+               std::to_string(static_cast<unsigned long long>(::getuid()));
+    }
+
     bool save() const {
         return write_to_path(config_path());
     }

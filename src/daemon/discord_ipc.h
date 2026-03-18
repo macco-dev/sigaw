@@ -309,7 +309,7 @@ public:
     }
 
     /* Non-blocking event poll. Returns empty json if nothing pending. */
-    json poll_event() {
+    json poll_event(int timeout_ms = 0) {
         json queued;
         if (inbox_.take_dispatch(queued)) {
             return queued;
@@ -317,7 +317,7 @@ public:
 
         while (fd_ >= 0) {
             struct pollfd pfd = {fd_, POLLIN, 0};
-            if (::poll(&pfd, 1, 0) <= 0) return {};
+            if (::poll(&pfd, 1, timeout_ms) <= 0) return {};
             if (!(pfd.revents & POLLIN)) return {};
 
             Opcode op;
@@ -350,6 +350,7 @@ public:
         return {};
     }
 
+    int fd() const { return fd_; }
     bool is_connected()    const { return connected_; }
     bool is_authenticated() const { return authed_; }
     const DiscordUserIdentity& local_user() const { return inbox_.local_user(); }
