@@ -49,7 +49,8 @@ client_secret=HD2VNfR0HxOiLSMM842PMDDv-SbW1r6Z
 
 # ---- Optional Per-Game Overlay Profiles ----
 #
-# Match on the exact executable basename from /proc/self/exe.
+# Match on the exact hooked process basename.
+# On Wine/Proton, Sigaw matches the Windows game executable basename.
 # These sections override overlay settings only. Discord credentials remain global.
 #
 # Example: launch `sigaw-run vkcube` or `SIGAW=1 vkcube` and Sigaw will apply

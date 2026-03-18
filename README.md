@@ -210,12 +210,14 @@ compact=true
 show_voice_channel_chat=true
 ```
 
-Profile matching is exact and case-sensitive, using the hooked process basename
-from `/proc/self/exe`. Profiles override overlay settings only; Discord
-credentials remain global.
+Profile matching is exact and case-sensitive, using the hooked process basename.
+On Wine/Proton, Sigaw matches the Windows game executable basename instead of
+`wine-preloader`. Profiles override overlay settings only; Discord credentials
+remain global.
 
-When `show_voice_channel_chat=true`, Sigaw will request Discord's `messages.read`
-scope the next time the daemon reconnects or reloads authentication.
+When the global config or any profile enables `show_voice_channel_chat`, Sigaw
+will request Discord's `messages.read` scope the next time the daemon reconnects
+or reloads authentication.
 
 ## CLI
 

@@ -2087,6 +2087,9 @@ struct Runtime::Impl {
     std::unordered_map<uint64_t, float> speaking_times_ms;
     std::chrono::steady_clock::time_point last_speaking_tick = {};
     std::vector<uint8_t> rgba;
+    std::vector<uint8_t> cached_rgba;
+    uint32_t cached_width = 0;
+    uint32_t cached_height = 0;
     uint64_t frame_sequence = 0;
     bool debug = std::getenv("SIGAW_DEBUG") != nullptr;
 
@@ -2202,8 +2205,22 @@ struct Runtime::Impl {
         out.width = crop_w;
         out.height = crop_h;
         out.byte_size = rgba.size();
-        out.sequence = ++frame_sequence;
-        out.changed = true;
+        const bool pixels_changed =
+            cached_width != crop_w ||
+            cached_height != crop_h ||
+            cached_rgba.size() != rgba.size() ||
+            cached_rgba.empty() ||
+            std::memcmp(cached_rgba.data(), rgba.data(), rgba.size()) != 0;
+        if (pixels_changed) {
+            cached_rgba = rgba;
+            cached_width = crop_w;
+            cached_height = crop_h;
+            out.sequence = ++frame_sequence;
+            out.changed = true;
+        } else {
+            out.sequence = frame_sequence;
+            out.changed = false;
+        }
         return out;
     }
 };

@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <iterator>
 #include <unordered_map>
 #include <unistd.h>
 #include <vector>
@@ -74,6 +75,14 @@ struct Config {
         }
 
         return cfg;
+    }
+
+    static bool any_profile_requests_chat() {
+        return any_profile_requests_chat(parse_file(config_path()));
+    }
+
+    bool requests_voice_channel_chat() const {
+        return show_voice_channel_chat && max_visible_chat_messages > 0;
     }
 
     static std::filesystem::path config_path() {
@@ -184,6 +193,11 @@ struct Config {
     }
 
     static std::string current_executable_basename() {
+        if (const std::string windows_basename = current_windows_executable_basename();
+            !windows_basename.empty()) {
+            return windows_basename;
+        }
+
         std::error_code ec;
         const auto target = std::filesystem::read_symlink("/proc/self/exe", ec);
         if (ec) {
@@ -216,6 +230,77 @@ private:
         SectionKind kind = SectionKind::Global;
         std::string name;
     };
+
+    static std::string basename_from_pathish(std::string_view value) {
+        const auto sep = value.find_last_of("/\\");
+        if (sep == std::string_view::npos) {
+            return std::string(value);
+        }
+        return std::string(value.substr(sep + 1));
+    }
+
+    static bool ends_with_case_insensitive(std::string_view value, std::string_view suffix) {
+        if (value.size() < suffix.size()) {
+            return false;
+        }
+
+        const size_t offset = value.size() - suffix.size();
+        for (size_t i = 0; i < suffix.size(); ++i) {
+            const auto lhs = static_cast<unsigned char>(value[offset + i]);
+            const auto rhs = static_cast<unsigned char>(suffix[i]);
+            if (std::tolower(lhs) != std::tolower(rhs)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool is_wine_like_environment() {
+        const char* compat = std::getenv("STEAM_COMPAT_DATA_PATH");
+        if (compat && *compat) {
+            return true;
+        }
+
+        const char* wineprefix = std::getenv("WINEPREFIX");
+        if (wineprefix && *wineprefix) {
+            return true;
+        }
+
+        const char* winedllpath = std::getenv("WINEDLLPATH");
+        return winedllpath && *winedllpath;
+    }
+
+    static std::string current_windows_executable_basename() {
+        if (!is_wine_like_environment()) {
+            return {};
+        }
+
+        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+        if (!cmdline.is_open()) {
+            return {};
+        }
+
+        const std::string data((std::istreambuf_iterator<char>(cmdline)),
+                               std::istreambuf_iterator<char>());
+        std::string match;
+        for (size_t start = 0; start < data.size();) {
+            size_t end = data.find('\0', start);
+            if (end == std::string::npos) {
+                end = data.size();
+            }
+
+            const std::string basename = basename_from_pathish(
+                std::string_view(data.data() + start, end - start)
+            );
+            if (ends_with_case_insensitive(basename, ".exe")) {
+                match = basename;
+            }
+
+            start = end + 1;
+        }
+
+        return match;
+    }
 
     static std::string trim_copy(std::string_view value) {
         const auto first = value.find_first_not_of(" \t\r\n");
@@ -385,6 +470,22 @@ private:
         }
     }
 
+    static bool any_profile_requests_chat(const ParsedConfigFile& parsed) {
+        Config global_cfg;
+        apply_entries(global_cfg, parsed.global_entries, true);
+
+        for (const auto& [name, entries] : parsed.profile_entries) {
+            (void)name;
+            Config profile_cfg = global_cfg;
+            apply_entries(profile_cfg, entries, false);
+            if (profile_cfg.requests_voice_channel_chat()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     static ParsedConfigFile parse_file(const std::filesystem::path& path) {
         ParsedConfigFile parsed;
         std::ifstream file(path);
@@ -530,7 +631,8 @@ private:
         append("client_secret=" + client_secret);
         append("");
         append("# Optional exact executable-basename profiles.");
-        append("# Matching is case-sensitive and uses /proc/self/exe, e.g. [profile:vkcube].");
+        append("# Matching is case-sensitive and uses the hooked process basename.");
+        append("# On Wine/Proton, Sigaw matches the Windows game executable basename.");
         append("#");
         append("# [profile:vkcube]");
         append("# position=bottom-left");

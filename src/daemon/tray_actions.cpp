@@ -2,8 +2,17 @@
 
 namespace sigaw::tray {
 
+namespace {
+
+bool daemon_chat_requested(const Config& config, bool profile_chat_requested) {
+    return config.requests_voice_channel_chat() || profile_chat_requested;
+}
+
+} // namespace
+
 PlannedAction plan_action(Action action,
                           const Config& current,
+                          bool profile_chat_requested,
                           bool have_messages_read_scope)
 {
     PlannedAction planned;
@@ -22,12 +31,15 @@ PlannedAction plan_action(Action action,
             next.show_voice_channel_chat = !next.show_voice_channel_chat;
             planned.updated_config = next;
             planned.overlay_dirty = true;
+            const bool current_chat_requested = daemon_chat_requested(current, profile_chat_requested);
+            const bool next_chat_requested = daemon_chat_requested(next, profile_chat_requested);
 
-            if (next.show_voice_channel_chat) {
-                planned.refresh_chat_state = have_messages_read_scope;
-                planned.reconnect_requested = !have_messages_read_scope;
-            } else {
+            if (!next_chat_requested) {
                 planned.clear_chat_state = true;
+            } else if (!current_chat_requested && have_messages_read_scope) {
+                planned.refresh_chat_state = true;
+            } else if (!current_chat_requested) {
+                planned.reconnect_requested = true;
             }
             break;
         }

@@ -135,6 +135,38 @@ bool test_profile_overrides_apply_per_executable() {
     return true;
 }
 
+bool test_profile_chat_requests_are_detected_for_daemon() {
+    ConfigEnvGuard guard(unique_config_path());
+    write_file(
+        guard.path_,
+        "show_voice_channel_chat=false\n"
+        "max_visible_chat_messages=4\n"
+        "\n"
+        "[profile:vkcube]\n"
+        "show_voice_channel_chat=true\n"
+    );
+
+    if (!sigaw::Config::any_profile_requests_chat()) {
+        std::cerr << "profile-only chat enable should be visible to daemon auth\n";
+        return false;
+    }
+
+    write_file(
+        guard.path_,
+        "show_voice_channel_chat=false\n"
+        "\n"
+        "[profile:vkcube]\n"
+        "compact=true\n"
+    );
+
+    if (sigaw::Config::any_profile_requests_chat()) {
+        std::cerr << "non-chat profile overrides should not request daemon chat scope\n";
+        return false;
+    }
+
+    return true;
+}
+
 bool test_save_preserves_profile_sections_and_comments() {
     ConfigEnvGuard guard(unique_config_path());
     write_file(
@@ -186,6 +218,9 @@ int main() {
         return 1;
     }
     if (!test_profile_overrides_apply_per_executable()) {
+        return 1;
+    }
+    if (!test_profile_chat_requests_are_detected_for_daemon()) {
         return 1;
     }
     if (!test_save_preserves_profile_sections_and_comments()) {

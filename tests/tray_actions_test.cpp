@@ -11,6 +11,7 @@ bool test_toggle_overlay_requests_persist_and_refresh() {
     const auto planned = sigaw::tray::plan_action(
         sigaw::tray::Action::ToggleOverlay,
         cfg,
+        false,
         false
     );
 
@@ -34,6 +35,7 @@ bool test_toggle_compact_requests_persist_and_refresh() {
     const auto planned = sigaw::tray::plan_action(
         sigaw::tray::Action::ToggleCompactMode,
         cfg,
+        false,
         true
     );
 
@@ -56,6 +58,7 @@ bool test_disable_voice_messages_clears_chat_immediately() {
     const auto planned = sigaw::tray::plan_action(
         sigaw::tray::Action::ToggleVoiceMessages,
         cfg,
+        false,
         true
     );
 
@@ -72,6 +75,30 @@ bool test_disable_voice_messages_clears_chat_immediately() {
     return true;
 }
 
+bool test_disable_global_voice_messages_keeps_chat_when_profile_still_requires_it() {
+    sigaw::Config cfg;
+    cfg.show_voice_channel_chat = true;
+
+    const auto planned = sigaw::tray::plan_action(
+        sigaw::tray::Action::ToggleVoiceMessages,
+        cfg,
+        true,
+        true
+    );
+
+    if (!planned.updated_config || planned.updated_config->show_voice_channel_chat) {
+        std::cerr << "toggle voice messages should still disable the global flag\n";
+        return false;
+    }
+    if (!planned.overlay_dirty || planned.clear_chat_state ||
+        planned.refresh_chat_state || planned.reconnect_requested) {
+        std::cerr << "profile-backed chat should stay live when only the global flag turns off\n";
+        return false;
+    }
+
+    return true;
+}
+
 bool test_enable_voice_messages_with_scope_refreshes_without_reconnect() {
     sigaw::Config cfg;
     cfg.show_voice_channel_chat = false;
@@ -79,6 +106,7 @@ bool test_enable_voice_messages_with_scope_refreshes_without_reconnect() {
     const auto planned = sigaw::tray::plan_action(
         sigaw::tray::Action::ToggleVoiceMessages,
         cfg,
+        false,
         true
     );
 
@@ -102,6 +130,7 @@ bool test_enable_voice_messages_without_scope_requests_reconnect() {
     const auto planned = sigaw::tray::plan_action(
         sigaw::tray::Action::ToggleVoiceMessages,
         cfg,
+        false,
         false
     );
 
@@ -124,6 +153,7 @@ bool test_reload_and_stop_actions_map_to_daemon_controls() {
     const auto reload = sigaw::tray::plan_action(
         sigaw::tray::Action::ReloadConfig,
         cfg,
+        false,
         true
     );
     if (!reload.reload_requested || reload.updated_config || reload.stop_daemon) {
@@ -134,6 +164,7 @@ bool test_reload_and_stop_actions_map_to_daemon_controls() {
     const auto stop = sigaw::tray::plan_action(
         sigaw::tray::Action::StopDaemon,
         cfg,
+        false,
         true
     );
     if (!stop.stop_daemon || stop.updated_config || stop.reload_requested) {
@@ -154,6 +185,9 @@ int main() {
         return 1;
     }
     if (!test_disable_voice_messages_clears_chat_immediately()) {
+        return 1;
+    }
+    if (!test_disable_global_voice_messages_keeps_chat_when_profile_still_requires_it()) {
         return 1;
     }
     if (!test_enable_voice_messages_with_scope_refreshes_without_reconnect()) {

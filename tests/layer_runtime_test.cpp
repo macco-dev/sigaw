@@ -1,8 +1,13 @@
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <sys/wait.h>
+#include <unistd.h>
 
+#include "common/config.h"
 #include "layer/vk_dispatch.h"
 #include "layer/wine_policy.h"
 
@@ -106,6 +111,47 @@ bool test_wine_policy_parsing() {
     return true;
 }
 
+bool test_current_executable_basename_uses_wine_game_argument() {
+    ScopedEnv compat("STEAM_COMPAT_DATA_PATH", "/tmp/compat");
+
+    std::error_code ec;
+    const auto self = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec || self.empty()) {
+        std::cerr << "failed to resolve test binary path via /proc/self/exe\n";
+        return false;
+    }
+
+    const pid_t child = fork();
+    if (child < 0) {
+        std::cerr << "fork failed: " << std::strerror(errno) << "\n";
+        return false;
+    }
+
+    if (child == 0) {
+        execl(
+            self.c_str(),
+            self.c_str(),
+            "--verify-current-exe",
+            "Z:\\Games\\TestGame.exe",
+            static_cast<char*>(nullptr)
+        );
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0) {
+        std::cerr << "waitpid failed: " << std::strerror(errno) << "\n";
+        return false;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        std::cerr << "Wine basename child verification failed\n";
+        return false;
+    }
+
+    return true;
+}
+
 bool test_dispatch_resolution_complete() {
     SigawVulkanDispatch dispatch = {};
     g_omit_sampler = false;
@@ -141,11 +187,24 @@ bool test_dispatch_resolution_missing_entry() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--verify-current-exe") == 0) {
+        const auto detected = sigaw::Config::current_executable_basename();
+        if (detected != "TestGame.exe") {
+            std::cerr << "expected Wine basename detection to return TestGame.exe, got "
+                      << detected << "\n";
+            return 1;
+        }
+        return 0;
+    }
+
     if (!test_wine_policy_defaults()) {
         return 1;
     }
     if (!test_wine_policy_parsing()) {
+        return 1;
+    }
+    if (!test_current_executable_basename_uses_wine_game_argument()) {
         return 1;
     }
     if (!test_dispatch_resolution_complete()) {

@@ -44,22 +44,32 @@ static void update_tray(sigaw::tray::Icon* tray,
                         const sigaw::VoiceState& voice);
 static TrayLoopResult process_tray_actions(sigaw::tray::Icon* tray,
                                            sigaw::Config& config,
+                                           bool profile_chat_requested,
                                            bool have_messages_read_scope,
                                            sigaw::VoiceRuntimeState* runtime = nullptr,
                                            sigaw::DiscordIpc* ipc = nullptr);
 
+static bool daemon_chat_requested(const sigaw::Config& config,
+                                  bool profile_chat_requested)
+{
+    return config.requests_voice_channel_chat() || profile_chat_requested;
+}
+
 static bool daemon_requires_reconnect(const sigaw::Config& current,
                                       const sigaw::Config& updated,
+                                      bool current_chat_requested,
+                                      bool updated_chat_requested,
                                       bool have_messages_read_scope = false)
 {
     return current.client_id != updated.client_id ||
            current.client_secret != updated.client_secret ||
-           (!current.show_voice_channel_chat &&
-            updated.show_voice_channel_chat &&
+           (!current_chat_requested &&
+            updated_chat_requested &&
             !have_messages_read_scope);
 }
 
 static bool wait_with_control(sigaw::ControlServer& ctl, sigaw::Config& config,
+                              bool* profile_chat_requested,
                               sigaw::ConfigWatcher* config_watcher,
                               int total_ms,
                               sigaw::tray::Icon* tray = nullptr,
@@ -67,7 +77,12 @@ static bool wait_with_control(sigaw::ControlServer& ctl, sigaw::Config& config,
 {
     const sigaw::VoiceState no_voice;
     for (int elapsed = 0; elapsed < total_ms && g_running; elapsed += 100) {
-        const auto tray_result = process_tray_actions(tray, config, false);
+        const auto tray_result = process_tray_actions(
+            tray,
+            config,
+            profile_chat_requested ? *profile_chat_requested : false,
+            false
+        );
         if (tray_result.quit_requested) {
             g_running = 0;
             return false;
@@ -81,8 +96,18 @@ static bool wait_with_control(sigaw::ControlServer& ctl, sigaw::Config& config,
 
         if (config_watcher && config_watcher->consume_change()) {
             const auto updated = sigaw::Config::load();
-            const bool reconnect = daemon_requires_reconnect(config, updated);
+            const bool updated_profile_chat_requested =
+                sigaw::Config::any_profile_requests_chat();
+            const bool reconnect = daemon_requires_reconnect(
+                config,
+                updated,
+                daemon_chat_requested(config, profile_chat_requested ? *profile_chat_requested : false),
+                daemon_chat_requested(updated, updated_profile_chat_requested)
+            );
             config = updated;
+            if (profile_chat_requested) {
+                *profile_chat_requested = updated_profile_chat_requested;
+            }
             if (reconnect) {
                 if (reconnect_requested) {
                     *reconnect_requested = true;
@@ -97,6 +122,9 @@ static bool wait_with_control(sigaw::ControlServer& ctl, sigaw::Config& config,
             return false;
         }
         if (action == sigaw::ControlServer::Action::Reload) {
+            if (profile_chat_requested) {
+                *profile_chat_requested = sigaw::Config::any_profile_requests_chat();
+            }
             if (reconnect_requested) {
                 *reconnect_requested = true;
             }
@@ -180,10 +208,6 @@ static void update_shm(sigaw::ShmWriter& shm,
     shm.end_write();
 }
 
-static bool chat_requested(const sigaw::Config& config) {
-    return config.show_voice_channel_chat && config.max_visible_chat_messages > 0;
-}
-
 static void unsubscribe_chat_events(sigaw::VoiceRuntimeState& runtime,
                                     sigaw::DiscordIpc& ipc)
 {
@@ -215,10 +239,9 @@ static bool clear_chat_state(sigaw::VoiceRuntimeState& runtime,
 
 static bool refresh_chat_state(sigaw::VoiceRuntimeState& runtime,
                                sigaw::DiscordIpc& ipc,
-                               const sigaw::Config& config)
+                               bool want_chat)
 {
-    const bool want_chat = chat_requested(config) && ipc.has_scope("messages.read");
-    if (!want_chat || runtime.voice.channel_id.empty()) {
+    if (!want_chat || !ipc.has_scope("messages.read") || runtime.voice.channel_id.empty()) {
         return clear_chat_state(runtime, &ipc);
     }
 
@@ -308,6 +331,7 @@ static void update_tray(sigaw::tray::Icon* tray,
 
 static TrayLoopResult process_tray_actions(sigaw::tray::Icon* tray,
                                            sigaw::Config& config,
+                                           bool profile_chat_requested,
                                            bool have_messages_read_scope,
                                            sigaw::VoiceRuntimeState* runtime,
                                            sigaw::DiscordIpc* ipc)
@@ -324,6 +348,7 @@ static TrayLoopResult process_tray_actions(sigaw::tray::Icon* tray,
         const auto planned = sigaw::tray::plan_action(
             action,
             config,
+            profile_chat_requested,
             have_messages_read_scope
         );
 
@@ -345,7 +370,11 @@ static TrayLoopResult process_tray_actions(sigaw::tray::Icon* tray,
             }
         }
         if (planned.refresh_chat_state && runtime && ipc) {
-            const bool chat_changed = refresh_chat_state(*runtime, *ipc, config);
+            const bool chat_changed = refresh_chat_state(
+                *runtime,
+                *ipc,
+                daemon_chat_requested(config, profile_chat_requested)
+            );
             result.state_changed = result.state_changed || chat_changed;
         }
         if (planned.reload_requested || planned.reconnect_requested) {
@@ -397,6 +426,7 @@ int main(int argc, char** argv) {
 
     /* Load config */
     sigaw::Config config = sigaw::Config::load();
+    bool profile_chat_requested = sigaw::Config::any_profile_requests_chat();
     sigaw::ConfigWatcher config_watcher;
     config_watcher.sync();
 
@@ -459,19 +489,24 @@ int main(int argc, char** argv) {
 
             if (!ipc.connect()) {
                 fprintf(stderr, "[sigaw] Discord not found, retrying in 5s...\n");
-                wait_with_control(ctl, config, &config_watcher, 5000, &tray);
+                wait_with_control(
+                    ctl, config, &profile_chat_requested, &config_watcher, 5000, &tray
+                );
                 continue;
             }
 
             if (!ipc.handshake()) {
                 fprintf(stderr, "[sigaw] Handshake failed, retrying in 5s...\n");
-                wait_with_control(ctl, config, &config_watcher, 5000, &tray);
+                wait_with_control(
+                    ctl, config, &profile_chat_requested, &config_watcher, 5000, &tray
+                );
                 continue;
             }
 
             /* Authenticate */
-            bool authorized = ipc.authorize(config.client_secret, chat_requested(config));
-            if (!authorized && chat_requested(config)) {
+            const bool want_daemon_chat = daemon_chat_requested(config, profile_chat_requested);
+            bool authorized = ipc.authorize(config.client_secret, want_daemon_chat);
+            if (!authorized && want_daemon_chat) {
                 fprintf(stderr,
                         "[sigaw] Chat authorization failed; continuing with voice-only overlay\n");
                 authorized = ipc.authorize(config.client_secret, false);
@@ -479,7 +514,9 @@ int main(int argc, char** argv) {
             if (!authorized) {
                 fprintf(stderr, "[sigaw] Auth failed (check client_id/secret)\n");
                 fprintf(stderr, "[sigaw] Retrying in 10s...\n");
-                wait_with_control(ctl, config, &config_watcher, 10000, &tray);
+                wait_with_control(
+                    ctl, config, &profile_chat_requested, &config_watcher, 10000, &tray
+                );
                 continue;
             }
 
@@ -509,7 +546,9 @@ int main(int argc, char** argv) {
                         runtime.voice.channel_name.c_str(), runtime.voice.users.size());
             }
 
-            (void)refresh_chat_state(runtime, ipc, config);
+            (void)refresh_chat_state(
+                runtime, ipc, daemon_chat_requested(config, profile_chat_requested)
+            );
             update_shm(shm, runtime.voice, avatar_cache);
             update_tray(&tray, config, true, runtime.voice);
 
@@ -524,6 +563,7 @@ int main(int argc, char** argv) {
                 const auto tray_result = process_tray_actions(
                     &tray,
                     config,
+                    profile_chat_requested,
                     ipc.has_scope("messages.read"),
                     &runtime,
                     &ipc
@@ -626,7 +666,11 @@ int main(int argc, char** argv) {
                             runtime.voice.channel_name.c_str(), runtime.voice.users.size());
                 }
                 state_changed = state_changed || sync_update.state_changed;
-                const bool chat_state_changed = refresh_chat_state(runtime, ipc, config);
+                const bool chat_state_changed = refresh_chat_state(
+                    runtime,
+                    ipc,
+                    daemon_chat_requested(config, profile_chat_requested)
+                );
                 state_changed = state_changed || chat_state_changed;
 
                 const uint64_t now_ms = sigaw::chat::steady_clock_now_ms();
@@ -641,14 +685,25 @@ int main(int argc, char** argv) {
                 if (config_watcher.consume_change()) {
                     const auto current = config;
                     const auto updated = sigaw::Config::load();
+                    const bool updated_profile_chat_requested =
+                        sigaw::Config::any_profile_requests_chat();
                     reconnect_requested = daemon_requires_reconnect(
-                        current, updated, ipc.has_scope("messages.read")
+                        current,
+                        updated,
+                        daemon_chat_requested(current, profile_chat_requested),
+                        daemon_chat_requested(updated, updated_profile_chat_requested),
+                        ipc.has_scope("messages.read")
                     );
                     config = updated;
+                    profile_chat_requested = updated_profile_chat_requested;
                     if (reconnect_requested) {
                         break;
                     }
-                    const bool chat_changed = refresh_chat_state(runtime, ipc, config);
+                    const bool chat_changed = refresh_chat_state(
+                        runtime,
+                        ipc,
+                        daemon_chat_requested(config, profile_chat_requested)
+                    );
                     state_changed = state_changed || chat_changed;
                 }
 
@@ -658,6 +713,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 if (action == sigaw::ControlServer::Action::Reload) {
+                    profile_chat_requested = sigaw::Config::any_profile_requests_chat();
                     reconnect_requested = true;
                     break;
                 }
@@ -679,7 +735,9 @@ int main(int argc, char** argv) {
             }
 
             if (!reconnect_requested) {
-                wait_with_control(ctl, config, &config_watcher, 2000, &tray);
+                wait_with_control(
+                    ctl, config, &profile_chat_requested, &config_watcher, 2000, &tray
+                );
             }
         }
     }

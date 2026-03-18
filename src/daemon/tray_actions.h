@@ -29,6 +29,7 @@ struct PlannedAction {
 
 PlannedAction plan_action(Action action,
                           const Config& current,
+                          bool profile_chat_requested,
                           bool have_messages_read_scope);
 
 } /* namespace sigaw::tray */

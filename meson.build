@@ -490,6 +490,22 @@ test(
   layer_runtime_test,
 )
 
+overlay_runtime_prepare_test = executable(
+  'sigaw-overlay-runtime-prepare-test',
+  [
+    'tests/overlay_runtime_prepare_test.cpp',
+    'src/layer/overlay_renderer.cpp',
+  ],
+  include_directories: include_directories('src'),
+  dependencies: [vulkan_dep, rt_dep, thread_dep, freetype_dep, png_dep],
+  cpp_args: layer_cpp_args,
+)
+
+test(
+  'sigaw-overlay-runtime-prepare',
+  overlay_runtime_prepare_test,
+)
+
 sh_prog = find_program('sh', required: true)
 
 test(
