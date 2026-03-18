@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#23A559"/>
+      <stop offset="100%" stop-color="#1A7F42"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2B2D31"/>
+      <stop offset="100%" stop-color="#1E1F22"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect x="32" y="32" width="448" height="448" rx="80" fill="url(#bg)"/>
+
+  <!-- Voice wave arcs (speaking indicator) -->
+  <!-- Outer arc -->
+  <path d="M 340 180 A 120 120 0 0 1 340 332"
+        stroke="#23A559" stroke-width="18" stroke-linecap="round"
+        fill="none" opacity="0.4"/>
+
+  <!-- Middle arc -->
+  <path d="M 310 210 A 75 75 0 0 1 310 302"
+        stroke="#23A559" stroke-width="18" stroke-linecap="round"
+        fill="none" opacity="0.65"/>
+
+  <!-- Inner arc -->
+  <path d="M 280 235 A 40 40 0 0 1 280 277"
+        stroke="#23A559" stroke-width="18" stroke-linecap="round"
+        fill="none" opacity="0.9"/>
+
+  <!-- User silhouette (head) -->
+  <circle cx="200" cy="215" r="52" fill="url(#glow)"/>
+
+  <!-- User silhouette (shoulders) -->
+  <path d="M 120 350 Q 120 290 200 285 Q 280 290 280 350"
+        fill="url(#glow)"/>
+
+  <!-- Overlay panel indicator (small rectangles suggesting UI) -->
+  <rect x="148" y="380" width="105" height="8" rx="4" fill="#B5BAC1" opacity="0.3"/>
+  <rect x="148" y="396" width="75" height="8" rx="4" fill="#B5BAC1" opacity="0.2"/>
+
+  <!-- Macco red eye accent -->
+  <circle cx="412" cy="100" r="12" fill="#E8403A"/>
+</svg>

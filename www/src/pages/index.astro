@@ -1,0 +1,496 @@
+---
+import Layout from '../layouts/Layout.astro';
+
+const features = [
+  {
+    title: 'Works on Wayland',
+    description:
+      'Injects into the game\u2019s own frame. No transparent windows, no compositor hacks, no Wayland limitations.',
+    icon: '\u{1F5A5}',
+  },
+  {
+    title: 'Vulkan & OpenGL',
+    description:
+      'Implicit Vulkan layer plus LD_PRELOAD for OpenGL - the same proven approach as MangoHUD and DXVK.',
+    icon: '\u{1F3AE}',
+  },
+  {
+    title: 'Live Voice State',
+    description:
+      'Speaking, mute, and deaf indicators updated in real-time with Discord avatar support.',
+    icon: '\u{1F50A}',
+  },
+  {
+    title: 'Fully Configurable',
+    description:
+      'Per-game profiles, overlay positioning, scale, compact mode, chat overlay, and system tray controls.',
+    icon: '\u2699\uFE0F',
+  },
+];
+
+const screenshots = [
+  { src: '/screenshots/overlay-standard-detail.png', caption: 'Standard layout', sub: 'Channel header, live speaking state, and inline mute icons.' },
+  { src: '/screenshots/overlay-chat-detail.png', caption: 'Voice chat', sub: 'Recent channel messages fade beneath the roster.' },
+  { src: '/screenshots/overlay-compact-detail.png', caption: 'Compact mode', sub: 'Avatar-first rows with badge indicators.' },
+  { src: '/screenshots/overlay-overflow-detail.png', caption: 'Larger channels', sub: 'Extra users collapse into a +N more row.' },
+];
+---
+
+<Layout
+  title="Sigaw - Discord voice overlay for Linux"
+  description="Sigaw renders a Discord voice channel overlay directly inside your game\u2019s Vulkan or OpenGL render pipeline. Works on Wayland fullscreen."
+>
+  <!-- Nav -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="/" class="nav-brand">
+        <img src="/sigaw-logo.svg" alt="Sigaw logo" width="32" height="32" />
+        <span>Sigaw</span>
+      </a>
+      <div class="nav-links">
+        <a href="https://github.com/macco-dev/sigaw" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://git.macco.dev/macco/sigaw" target="_blank" rel="noopener">Source</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <!-- Hero -->
+    <section class="hero">
+      <div class="hero-inner fade-in">
+        <img src="/sigaw-logo.svg" alt="Sigaw logo" class="hero-logo" width="160" height="160" />
+        <h1>Discord voice overlay<br />for Linux</h1>
+        <p class="hero-sub">
+          Sigaw renders your voice channel directly inside the game&rsquo;s
+          Vulkan or OpenGL frame &mdash; no transparent windows, no compositor hacks.
+          Fullscreen Wayland just works.
+        </p>
+        <div class="hero-actions">
+          <a href="#quickstart" class="btn btn-primary">Quick Start</a>
+          <a href="https://git.macco.dev/macco/sigaw" class="btn btn-outline" target="_blank" rel="noopener">View Source</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- Features -->
+    <section class="features" id="features">
+      <div class="section-inner">
+        <h2 class="section-title fade-in">Features</h2>
+        <div class="feature-grid">
+          {features.map((f, i) => (
+            <div class={`feature-card fade-in fade-in-d${i + 1}`}>
+              <span class="feature-icon">{f.icon}</span>
+              <h3>{f.title}</h3>
+              <p>{f.description}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+
+    <!-- Screenshots -->
+    <section class="screenshots" id="screenshots">
+      <div class="section-inner">
+        <h2 class="section-title fade-in">Overlay Modes</h2>
+        <div class="screenshot-strip fade-in fade-in-d1">
+          {screenshots.map((s) => (
+            <figure class="screenshot-item">
+              <img src={s.src} alt={s.caption} loading="lazy" />
+              <figcaption>
+                <strong>{s.caption}</strong>
+                <span>{s.sub}</span>
+              </figcaption>
+            </figure>
+          ))}
+        </div>
+      </div>
+    </section>
+
+    <!-- Quick Start -->
+    <section class="quickstart" id="quickstart">
+      <div class="section-inner">
+        <h2 class="section-title fade-in">Quick Start</h2>
+        <div class="steps fade-in fade-in-d1">
+          <div class="step">
+            <span class="step-num">1</span>
+            <div>
+              <h3>Build and install</h3>
+              <pre><code>git clone https://git.macco.dev/macco/sigaw.git
+cd sigaw
+meson setup build --prefix=/usr
+meson compile -C build
+sudo meson install -C build</code></pre>
+            </div>
+          </div>
+          <div class="step">
+            <span class="step-num">2</span>
+            <div>
+              <h3>Generate the config</h3>
+              <pre><code>sigaw-daemon --init-config
+$EDITOR ~/.config/sigaw/sigaw.conf</code></pre>
+            </div>
+          </div>
+          <div class="step">
+            <span class="step-num">3</span>
+            <div>
+              <h3>Start the daemon</h3>
+              <pre><code>sigaw-daemon --foreground</code></pre>
+              <p class="step-alt">Or enable the systemd user service:</p>
+              <pre><code>systemctl --user enable --now sigaw-daemon</code></pre>
+            </div>
+          </div>
+          <div class="step">
+            <span class="step-num">4</span>
+            <div>
+              <h3>Launch your game</h3>
+              <pre><code>sigaw-run ./my-game</code></pre>
+              <p class="step-alt">Steam launch option:</p>
+              <pre><code>sigaw-run %command%</code></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="footer-inner">
+      <p>MIT License &middot; <a href="https://macco.dev">macco.dev</a></p>
+    </div>
+  </footer>
+</Layout>
+
+<style>
+  /* Nav */
+  .nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    background: rgba(15, 17, 21, 0.85);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .nav-inner {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 0.75rem 1.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .nav-brand {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text);
+    font-weight: 700;
+    font-size: 1.15rem;
+  }
+
+  .nav-brand:hover {
+    text-decoration: none;
+    color: var(--accent);
+  }
+
+  .nav-links {
+    display: flex;
+    gap: 1.5rem;
+    font-size: 0.9rem;
+  }
+
+  .nav-links a {
+    color: var(--text-muted);
+    transition: color 0.2s;
+  }
+
+  .nav-links a:hover {
+    color: var(--accent);
+    text-decoration: none;
+  }
+
+  /* Hero */
+  .hero {
+    padding: 10rem 1.5rem 6rem;
+    text-align: center;
+  }
+
+  .hero-inner {
+    max-width: 680px;
+    margin: 0 auto;
+  }
+
+  .hero-logo {
+    margin-bottom: 2rem;
+    filter: drop-shadow(0 0 40px rgba(35, 165, 89, 0.25));
+  }
+
+  h1 {
+    font-size: clamp(2rem, 5vw, 3.5rem);
+    font-weight: 800;
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    margin-bottom: 1.25rem;
+  }
+
+  .hero-sub {
+    color: var(--text-muted);
+    font-size: 1.125rem;
+    max-width: 540px;
+    margin: 0 auto 2rem;
+    line-height: 1.7;
+  }
+
+  .hero-actions {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  .btn {
+    display: inline-block;
+    padding: 0.7rem 1.6rem;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 0.95rem;
+    transition: all 0.2s;
+  }
+
+  .btn:hover {
+    text-decoration: none;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .btn-primary:hover {
+    background: #1e9150;
+    box-shadow: 0 0 20px rgba(35, 165, 89, 0.3);
+  }
+
+  .btn-outline {
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+
+  .btn-outline:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* Sections */
+  .section-inner {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 5rem 1.5rem;
+  }
+
+  .section-title {
+    font-size: 1.75rem;
+    font-weight: 700;
+    text-align: center;
+    margin-bottom: 3rem;
+    letter-spacing: -0.01em;
+  }
+
+  /* Feature Cards */
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1.25rem;
+  }
+
+  .feature-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.75rem;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .feature-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 0 24px var(--accent-dim);
+  }
+
+  .feature-icon {
+    font-size: 1.5rem;
+    display: block;
+    margin-bottom: 0.75rem;
+  }
+
+  .feature-card h3 {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+  }
+
+  .feature-card p {
+    color: var(--text-muted);
+    font-size: 0.925rem;
+    line-height: 1.6;
+  }
+
+  /* Screenshots */
+  .screenshots {
+    background: var(--bg-card);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .screenshot-strip {
+    display: flex;
+    gap: 1.5rem;
+    overflow-x: auto;
+    padding-bottom: 1rem;
+    scroll-snap-type: x mandatory;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .screenshot-strip::-webkit-scrollbar {
+    height: 6px;
+  }
+
+  .screenshot-strip::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .screenshot-strip::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+  }
+
+  .screenshot-item {
+    flex: 0 0 280px;
+    scroll-snap-align: start;
+  }
+
+  .screenshot-item img {
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    width: 100%;
+  }
+
+  .screenshot-item figcaption {
+    margin-top: 0.75rem;
+    text-align: center;
+  }
+
+  .screenshot-item figcaption strong {
+    display: block;
+    font-size: 0.95rem;
+    margin-bottom: 0.25rem;
+  }
+
+  .screenshot-item figcaption span {
+    color: var(--text-muted);
+    font-size: 0.825rem;
+  }
+
+  /* Quick Start */
+  .quickstart {
+    background: var(--bg);
+  }
+
+  .steps {
+    max-width: 700px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2.5rem;
+  }
+
+  .step {
+    display: flex;
+    gap: 1.25rem;
+    align-items: flex-start;
+  }
+
+  .step-num {
+    flex-shrink: 0;
+    width: 2.25rem;
+    height: 2.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent-dim);
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 0.95rem;
+    border-radius: 50%;
+    margin-top: 0.15rem;
+  }
+
+  .step h3 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    margin-bottom: 0.75rem;
+  }
+
+  .step pre {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.65;
+    margin-bottom: 0.5rem;
+  }
+
+  .step pre code {
+    background: none;
+    padding: 0;
+    font-size: inherit;
+  }
+
+  .step-alt {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    margin-bottom: 0.4rem;
+  }
+
+  /* Footer */
+  .footer {
+    border-top: 1px solid var(--border);
+    padding: 2rem 1.5rem;
+    text-align: center;
+  }
+
+  .footer p {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }
+
+  /* Mobile */
+  @media (max-width: 640px) {
+    .hero {
+      padding: 8rem 1.25rem 4rem;
+    }
+
+    .hero-logo {
+      width: 120px;
+      height: 120px;
+    }
+
+    .feature-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .screenshot-item {
+      flex: 0 0 240px;
+    }
+
+    .step {
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+  }
+</style>
