@@ -1,4 +1,5 @@
 #include <vulkan/vulkan.h>
+#include <cassert>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +25,7 @@
 #include "overlay_preview.h"
 #include "overlay_runtime.h"
 #include "overlay_visibility.h"
+#include "vk_dispatch.h"
 #include "../common/config.h"
 #include "../common/config_watcher.h"
 #include "../common/protocol.h"
@@ -32,7 +34,8 @@
 extern "C" {
 struct SigawOverlayContext;
 SigawOverlayContext* sigaw_overlay_create(VkDevice, VkPhysicalDevice, VkInstance, uint32_t,
-                                          VkQueue, PFN_vkGetPhysicalDeviceMemoryProperties,
+                                          VkQueue, const SigawVulkanDispatch*,
+                                          PFN_vkGetPhysicalDeviceMemoryProperties,
                                           VkFormat, uint32_t, uint32_t);
 void sigaw_overlay_destroy(SigawOverlayContext*);
 void sigaw_overlay_resize(SigawOverlayContext*, VkFormat, uint32_t, uint32_t);
@@ -40,6 +43,88 @@ int sigaw_overlay_render(SigawOverlayContext*, VkQueue, VkImage, VkFormat,
                          uint32_t, uint32_t, uint32_t, const VkSemaphore*,
                          VkSemaphore, VkFence);
 }
+
+namespace {
+
+thread_local const SigawVulkanDispatch* g_sigaw_vk_dispatch = nullptr;
+
+class ScopedDispatch {
+public:
+    explicit ScopedDispatch(const SigawVulkanDispatch* dispatch)
+        : previous_(g_sigaw_vk_dispatch) {
+        g_sigaw_vk_dispatch = dispatch;
+    }
+
+    ~ScopedDispatch() {
+        g_sigaw_vk_dispatch = previous_;
+    }
+
+private:
+    const SigawVulkanDispatch* previous_;
+};
+
+static inline const SigawVulkanDispatch& sigaw_current_vk_dispatch() {
+    assert(g_sigaw_vk_dispatch != nullptr);
+    return *g_sigaw_vk_dispatch;
+}
+
+} // namespace
+
+#define vkAllocateCommandBuffers sigaw_current_vk_dispatch().AllocateCommandBuffers
+#define vkAllocateDescriptorSets sigaw_current_vk_dispatch().AllocateDescriptorSets
+#define vkAllocateMemory sigaw_current_vk_dispatch().AllocateMemory
+#define vkBeginCommandBuffer sigaw_current_vk_dispatch().BeginCommandBuffer
+#define vkBindBufferMemory sigaw_current_vk_dispatch().BindBufferMemory
+#define vkBindImageMemory sigaw_current_vk_dispatch().BindImageMemory
+#define vkCmdBeginRenderPass sigaw_current_vk_dispatch().CmdBeginRenderPass
+#define vkCmdBindDescriptorSets sigaw_current_vk_dispatch().CmdBindDescriptorSets
+#define vkCmdBindPipeline sigaw_current_vk_dispatch().CmdBindPipeline
+#define vkCmdCopyBufferToImage sigaw_current_vk_dispatch().CmdCopyBufferToImage
+#define vkCmdCopyImageToBuffer sigaw_current_vk_dispatch().CmdCopyImageToBuffer
+#define vkCmdDraw sigaw_current_vk_dispatch().CmdDraw
+#define vkCmdEndRenderPass sigaw_current_vk_dispatch().CmdEndRenderPass
+#define vkCmdPipelineBarrier sigaw_current_vk_dispatch().CmdPipelineBarrier
+#define vkCmdPushConstants sigaw_current_vk_dispatch().CmdPushConstants
+#define vkCmdSetScissor sigaw_current_vk_dispatch().CmdSetScissor
+#define vkCmdSetViewport sigaw_current_vk_dispatch().CmdSetViewport
+#define vkCreateBuffer sigaw_current_vk_dispatch().CreateBuffer
+#define vkCreateCommandPool sigaw_current_vk_dispatch().CreateCommandPool
+#define vkCreateDescriptorPool sigaw_current_vk_dispatch().CreateDescriptorPool
+#define vkCreateDescriptorSetLayout sigaw_current_vk_dispatch().CreateDescriptorSetLayout
+#define vkCreateFence sigaw_current_vk_dispatch().CreateFence
+#define vkCreateFramebuffer sigaw_current_vk_dispatch().CreateFramebuffer
+#define vkCreateGraphicsPipelines sigaw_current_vk_dispatch().CreateGraphicsPipelines
+#define vkCreateImage sigaw_current_vk_dispatch().CreateImage
+#define vkCreateImageView sigaw_current_vk_dispatch().CreateImageView
+#define vkCreatePipelineLayout sigaw_current_vk_dispatch().CreatePipelineLayout
+#define vkCreateRenderPass sigaw_current_vk_dispatch().CreateRenderPass
+#define vkCreateSampler sigaw_current_vk_dispatch().CreateSampler
+#define vkCreateShaderModule sigaw_current_vk_dispatch().CreateShaderModule
+#define vkDestroyBuffer sigaw_current_vk_dispatch().DestroyBuffer
+#define vkDestroyCommandPool sigaw_current_vk_dispatch().DestroyCommandPool
+#define vkDestroyDescriptorPool sigaw_current_vk_dispatch().DestroyDescriptorPool
+#define vkDestroyDescriptorSetLayout sigaw_current_vk_dispatch().DestroyDescriptorSetLayout
+#define vkDestroyFence sigaw_current_vk_dispatch().DestroyFence
+#define vkDestroyFramebuffer sigaw_current_vk_dispatch().DestroyFramebuffer
+#define vkDestroyImage sigaw_current_vk_dispatch().DestroyImage
+#define vkDestroyImageView sigaw_current_vk_dispatch().DestroyImageView
+#define vkDestroyPipeline sigaw_current_vk_dispatch().DestroyPipeline
+#define vkDestroyPipelineLayout sigaw_current_vk_dispatch().DestroyPipelineLayout
+#define vkDestroyRenderPass sigaw_current_vk_dispatch().DestroyRenderPass
+#define vkDestroySampler sigaw_current_vk_dispatch().DestroySampler
+#define vkDestroyShaderModule sigaw_current_vk_dispatch().DestroyShaderModule
+#define vkDeviceWaitIdle sigaw_current_vk_dispatch().DeviceWaitIdle
+#define vkEndCommandBuffer sigaw_current_vk_dispatch().EndCommandBuffer
+#define vkFreeMemory sigaw_current_vk_dispatch().FreeMemory
+#define vkGetBufferMemoryRequirements sigaw_current_vk_dispatch().GetBufferMemoryRequirements
+#define vkGetImageMemoryRequirements sigaw_current_vk_dispatch().GetImageMemoryRequirements
+#define vkMapMemory sigaw_current_vk_dispatch().MapMemory
+#define vkQueueSubmit sigaw_current_vk_dispatch().QueueSubmit
+#define vkResetCommandBuffer sigaw_current_vk_dispatch().ResetCommandBuffer
+#define vkResetFences sigaw_current_vk_dispatch().ResetFences
+#define vkUnmapMemory sigaw_current_vk_dispatch().UnmapMemory
+#define vkUpdateDescriptorSets sigaw_current_vk_dispatch().UpdateDescriptorSets
+#define vkWaitForFences sigaw_current_vk_dispatch().WaitForFences
 
 namespace {
 
@@ -857,6 +942,7 @@ struct Ctx {
     VkInstance       inst = VK_NULL_HANDLE;
     VkQueue          q = VK_NULL_HANDLE;
     uint32_t         qf = 0;
+    SigawVulkanDispatch dispatch = {};
     PFN_vkGetPhysicalDeviceMemoryProperties get_phys_props = nullptr;
     VkFormat         fmt = VK_FORMAT_UNDEFINED;
     uint32_t         sw = 0, sh = 0;
@@ -2348,10 +2434,15 @@ static void destroy_overlay_context(Ctx* ctx, bool wait_idle)
 SigawOverlayContext* sigaw_overlay_create(VkDevice device, VkPhysicalDevice phys_device,
                                           VkInstance instance, uint32_t queue_family,
                                           VkQueue queue,
+                                          const SigawVulkanDispatch* dispatch,
                                           PFN_vkGetPhysicalDeviceMemoryProperties get_phys_props,
                                           VkFormat format,
                                           uint32_t width, uint32_t height)
 {
+    if (!dispatch || !sigaw_vk_dispatch_complete(dispatch)) {
+        return nullptr;
+    }
+
     auto* ctx = new Ctx();
     auto& c = *ctx;
     c.dev = device;
@@ -2359,11 +2450,14 @@ SigawOverlayContext* sigaw_overlay_create(VkDevice device, VkPhysicalDevice phys
     c.inst = instance;
     c.qf = queue_family;
     c.q = queue;
+    c.dispatch = *dispatch;
     c.get_phys_props = get_phys_props;
     c.fmt = format;
     c.sw = width;
     c.sh = height;
     c.logged_first_render = false;
+
+    ScopedDispatch scoped(&c.dispatch);
 
     VkCommandPoolCreateInfo pi = {};
     pi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -2412,6 +2506,7 @@ void sigaw_overlay_destroy(SigawOverlayContext* handle) {
         return;
     }
 
+    ScopedDispatch scoped(&ctx->dispatch);
     destroy_overlay_context(ctx, true);
     delete ctx;
     fprintf(stderr, "[sigaw] Overlay shutdown\n");
@@ -2424,6 +2519,7 @@ void sigaw_overlay_resize(SigawOverlayContext* handle, VkFormat format,
         return;
     }
 
+    ScopedDispatch scoped(&ctx->dispatch);
     if (ctx->fmt != format) {
         ctx->fmt = format;
         destroy_target_views(*ctx);
@@ -2445,6 +2541,7 @@ int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,
         return 0;
     }
 
+    ScopedDispatch scoped(&ctx->dispatch);
     auto& c = *ctx;
     if (!c.ok) return 0;
 

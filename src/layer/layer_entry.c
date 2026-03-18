@@ -21,6 +21,8 @@
 #include <stdio.h>
 
 #include "swapchain_bookkeeping.h"
+#include "vk_dispatch.h"
+#include "wine_policy.h"
 
 #if defined(__GNUC__) || defined(__clang__)
 #define SIGAW_LAYER_EXPORT __attribute__((visibility("default")))
@@ -38,6 +40,7 @@ typedef struct SigawOverlayContext SigawOverlayContext;
 SigawOverlayContext* sigaw_overlay_create(VkDevice device, VkPhysicalDevice phys_device,
                                           VkInstance instance, uint32_t queue_family,
                                           VkQueue queue,
+                                          const SigawVulkanDispatch* dispatch,
                                           PFN_vkGetPhysicalDeviceMemoryProperties get_phys_props,
                                           VkFormat format,
                                           uint32_t width, uint32_t height);
@@ -67,6 +70,7 @@ int sigaw_overlay_render(SigawOverlayContext* ctx, VkQueue queue,
 #define MAX_INSTANCES 8
 #define MAX_DEVICES   8
 #define MAX_DEVICE_QUEUES 16
+#define MAX_INSTANCE_PHYSICAL_DEVICES 16
 
 typedef struct {
     VkInstance                instance;
@@ -76,6 +80,8 @@ typedef struct {
     PFN_vkGetPhysicalDeviceProperties get_phys_props;
     PFN_vkGetPhysicalDeviceMemoryProperties get_mem_props;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties get_queue_props;
+    VkPhysicalDevice          phys_devices[MAX_INSTANCE_PHYSICAL_DEVICES];
+    uint32_t                  phys_device_count;
 } InstanceData;
 
 typedef struct {
@@ -97,6 +103,11 @@ typedef struct {
     uint32_t                    queue_families[MAX_DEVICE_QUEUES];
     uint32_t                    queue_count;
     uint32_t                    overlay_queue_family;
+    SigawVulkanDispatch         dispatch;
+    SigawWinePolicy             wine_policy;
+    int                         under_wine;
+    int                         overlay_disabled;
+    int                         overlay_log_emitted;
     SigawOverlayContext*        overlay_ctx;
 } DeviceData;
 
@@ -143,6 +154,92 @@ static DeviceData* find_device_for_queue(VkQueue queue, uint32_t* queue_family) 
 
 static SwapchainData* find_swapchain(VkSwapchainKHR sc) {
     return sigaw_find_swapchain(g_swapchains, g_swapchain_count, sc);
+}
+
+static void cache_instance_physical_devices(InstanceData* data) {
+    if (!data || !data->enum_phys || data->instance == VK_NULL_HANDLE) {
+        return;
+    }
+
+    data->phys_device_count = 0;
+
+    uint32_t count = 0;
+    if (data->enum_phys(data->instance, &count, NULL) != VK_SUCCESS || count == 0) {
+        return;
+    }
+
+    if (count > MAX_INSTANCE_PHYSICAL_DEVICES) {
+        count = MAX_INSTANCE_PHYSICAL_DEVICES;
+    }
+
+    VkPhysicalDevice phys[MAX_INSTANCE_PHYSICAL_DEVICES];
+    if (data->enum_phys(data->instance, &count, phys) != VK_SUCCESS) {
+        return;
+    }
+
+    memcpy(data->phys_devices, phys, sizeof(VkPhysicalDevice) * count);
+    data->phys_device_count = count;
+}
+
+static InstanceData* find_instance_for_physical_device(VkPhysicalDevice phys_device) {
+    for (int i = 0; i < g_instance_count; i++) {
+        InstanceData* data = &g_instances[i];
+        if (data->instance == VK_NULL_HANDLE) {
+            continue;
+        }
+
+        if (data->phys_device_count == 0) {
+            cache_instance_physical_devices(data);
+        }
+
+        for (uint32_t j = 0; j < data->phys_device_count; ++j) {
+            if (data->phys_devices[j] == phys_device) {
+                return data;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static void log_overlay_message(DeviceData* dev, const char* message) {
+    if (!dev || dev->overlay_log_emitted || !message) {
+        return;
+    }
+
+    fprintf(stderr, "%s\n", message);
+    dev->overlay_log_emitted = 1;
+}
+
+static void disable_overlay(DeviceData* dev, const char* message) {
+    if (!dev) {
+        return;
+    }
+
+    if (dev->overlay_ctx) {
+        sigaw_overlay_destroy(dev->overlay_ctx);
+        dev->overlay_ctx = NULL;
+    }
+
+    dev->overlay_queue_family = UINT32_MAX;
+    dev->overlay_disabled = 1;
+    log_overlay_message(dev, message);
+}
+
+static void handle_overlay_init_failure(DeviceData* dev, const char* message) {
+    if (!dev) {
+        return;
+    }
+
+    if (dev->under_wine && dev->wine_policy == SIGAW_WINE_POLICY_AUTO) {
+        disable_overlay(
+            dev,
+            "[sigaw] Wine/Proton detected and overlay initialization failed; disabling overlay for this process. Set SIGAW_WINE_POLICY=force to keep retrying."
+        );
+        return;
+    }
+
+    log_overlay_message(dev, message);
 }
 
 static int overlay_supports_format(VkFormat format) {
@@ -204,6 +301,8 @@ sigaw_CreateInstance(const VkInstanceCreateInfo* pCreateInfo,
             (PFN_vkGetPhysicalDeviceMemoryProperties)get_proc(*pInstance, "vkGetPhysicalDeviceMemoryProperties");
         data->get_queue_props =
             (PFN_vkGetPhysicalDeviceQueueFamilyProperties)get_proc(*pInstance, "vkGetPhysicalDeviceQueueFamilyProperties");
+        data->phys_device_count = 0;
+        cache_instance_physical_devices(data);
     }
 
     return VK_SUCCESS;
@@ -217,6 +316,7 @@ sigaw_DestroyInstance(VkInstance instance,
     if (data && data->destroy_instance) {
         data->destroy_instance(instance, pAllocator);
         data->instance = VK_NULL_HANDLE;
+        data->phys_device_count = 0;
     }
 }
 
@@ -243,14 +343,17 @@ sigaw_CreateDevice(VkPhysicalDevice physicalDevice,
 
     chain_info->u.pLayerInfo = chain_info->u.pLayerInfo->pNext;
 
-    /* Find the instance for this physical device */
-    /* We need the instance to resolve instance-level functions */
-    VkInstance inst = VK_NULL_HANDLE;
-    for (int i = 0; i < g_instance_count; i++) {
-        /* Any valid instance should work here */
-        if (g_instances[i].instance != VK_NULL_HANDLE) {
-            inst = g_instances[i].instance;
-            break;
+    /* Find the instance that owns this physical device so instance-level
+     * dispatch resolves against the correct loader chain. */
+    InstanceData* inst_data = find_instance_for_physical_device(physicalDevice);
+    VkInstance inst = inst_data ? inst_data->instance : VK_NULL_HANDLE;
+    if (inst == VK_NULL_HANDLE) {
+        for (int i = 0; i < g_instance_count; i++) {
+            if (g_instances[i].instance != VK_NULL_HANDLE) {
+                inst = g_instances[i].instance;
+                inst_data = &g_instances[i];
+                break;
+            }
         }
     }
 
@@ -276,6 +379,12 @@ sigaw_CreateDevice(VkPhysicalDevice physicalDevice,
         data->gfx_queue_family = gfx_family;
         data->queue_count = 0;
         data->overlay_queue_family = UINT32_MAX;
+        sigaw_vk_dispatch_clear(&data->dispatch);
+        sigaw_vk_dispatch_resolve(&data->dispatch, get_instance_proc, inst, get_device_proc, *pDevice);
+        data->wine_policy = sigaw_wine_policy_from_env();
+        data->under_wine = sigaw_is_wine_environment();
+        data->overlay_disabled = 0;
+        data->overlay_log_emitted = 0;
         data->overlay_ctx = NULL;
 
         data->destroy_device =
@@ -351,6 +460,8 @@ sigaw_DestroyDevice(VkDevice device,
             data->overlay_ctx = NULL;
         }
         data->overlay_queue_family = UINT32_MAX;
+        data->overlay_disabled = 0;
+        data->overlay_log_emitted = 0;
         if (data->destroy_device) {
             data->destroy_device(device, pAllocator);
         }
@@ -449,14 +560,33 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
         pPresentInfo->swapchainCount > 0) {
         SwapchainData* sc = find_swapchain(pPresentInfo->pSwapchains[0]);
         InstanceData* inst_data = sc ? find_instance(dev->instance) : NULL;
-        if (sc && inst_data && queue_family != UINT32_MAX) {
+        if (dev->under_wine && dev->wine_policy == SIGAW_WINE_POLICY_DISABLE) {
+            disable_overlay(
+                dev,
+                "[sigaw] Wine/Proton detected; overlay disabled by SIGAW_WINE_POLICY=disable"
+            );
+        } else if (sc && inst_data && queue_family != UINT32_MAX &&
+                   !dev->overlay_disabled) {
+            if (!sigaw_vk_dispatch_complete(&dev->dispatch)) {
+                handle_overlay_init_failure(
+                    dev,
+                    "[sigaw] Overlay dispatch initialization incomplete; continuing without overlay"
+                );
+            } else {
             dev->overlay_ctx =
                 sigaw_overlay_create(dev->device, dev->phys_device, dev->instance,
                                      queue_family, queue,
+                                     &dev->dispatch,
                                      inst_data->get_mem_props,
                                      sc->format, sc->width, sc->height);
             if (dev->overlay_ctx) {
                 dev->overlay_queue_family = queue_family;
+            } else {
+                handle_overlay_init_failure(
+                    dev,
+                    "[sigaw] Overlay initialization failed; continuing without overlay"
+                );
+            }
             }
         }
     } else if (dev && dev->overlay_ctx && queue_family != UINT32_MAX &&
@@ -480,10 +610,16 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
             dev->overlay_ctx =
                 sigaw_overlay_create(dev->device, dev->phys_device, dev->instance,
                                      queue_family, queue,
+                                     &dev->dispatch,
                                      inst_data->get_mem_props,
                                      sc->format, sc->width, sc->height);
             if (dev->overlay_ctx) {
                 dev->overlay_queue_family = queue_family;
+            } else {
+                handle_overlay_init_failure(
+                    dev,
+                    "[sigaw] Overlay reinitialization failed; continuing without overlay"
+                );
             }
         }
     }

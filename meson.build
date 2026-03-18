@@ -116,7 +116,7 @@ layer_lib = shared_library(
   'Sigaw',
   layer_sources,
   include_directories: include_directories('src'),
-  dependencies: [vulkan_dep, rt_dep, thread_dep, freetype_dep, png_dep],
+  dependencies: [rt_dep, thread_dep, freetype_dep, png_dep],
   install: true,
   # Layer .so must be position-independent
   c_args: ['-fPIC', '-fvisibility=hidden'],
@@ -476,6 +476,26 @@ launcher_env_test = executable(
 test(
   'sigaw-launcher-env',
   launcher_env_test,
+)
+
+layer_runtime_test = executable(
+  'sigaw-layer-runtime-test',
+  'tests/layer_runtime_test.cpp',
+  include_directories: include_directories('src'),
+  dependencies: [vulkan_dep],
+)
+
+test(
+  'sigaw-layer-runtime',
+  layer_runtime_test,
+)
+
+sh_prog = find_program('sh', required: true)
+
+test(
+  'sigaw-layer-artifacts',
+  sh_prog,
+  args: [meson.current_source_dir() / 'tests' / 'layer_artifact_test.sh', layer_lib.full_path()],
 )
 
 # --------------------------------------------------------------------------

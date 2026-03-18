@@ -236,6 +236,7 @@ If the overlay does not appear:
 - Start it with `sigaw-run <game>`.
 - For Vulkan-only debugging, try `SIGAW=1 <game>`.
 - For OpenGL-only debugging, try `LD_PRELOAD=/usr/lib/libSigawGL.so <game>`.
+- On Proton/Wine, `SIGAW_WINE_POLICY=auto|force|disable` controls fallback behavior. `disable` is the safe escape hatch if an injected Vulkan layer keeps a game from launching.
 - Verify the daemon is running with `sigaw-ctl status`.
 - If you installed from source, confirm `sudo meson install -C build` completed successfully.
 - Avoid stacking another swap-buffer interposer on top of Sigaw.
