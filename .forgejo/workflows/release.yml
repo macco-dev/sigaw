@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ forgejo.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04-amd64
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      SIGAW_BUILD_DIR: /tmp/sigaw-release-build-${{ forgejo.run_number }}
+      SIGAW_STAGE_DIR: /tmp/sigaw-release-stage-${{ forgejo.run_number }}
+      SIGAW_DIST_DIR: /tmp/sigaw-release-dist-${{ forgejo.run_number }}
+    steps:
+      - name: Check out source
+        uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: contrib/ci/bootstrap-deps.sh
+
+      - name: Validate tag matches Meson version
+        run: |
+          source contrib/ci/common.sh
+          project_version="$(sigaw_version_from_meson)"
+          tag_version="${FORGEJO_REF_NAME#v}"
+          if [[ "${project_version}" != "${tag_version}" ]]; then
+            echo "meson.build version ${project_version} does not match tag ${FORGEJO_REF_NAME}" >&2
+            exit 1
+          fi
+
+      - name: Build, test, and stage install
+        run: contrib/ci/build-test-install.sh
+
+      - name: Package release assets
+        run: contrib/ci/package-artifacts.sh --version-label "${FORGEJO_REF_NAME#v}"
+
+      - name: Write release notes
+        run: |
+          if [[ "$(git cat-file -t "${FORGEJO_REF_NAME}")" == "tag" ]]; then
+            git for-each-ref --format='%(contents)' "refs/tags/${FORGEJO_REF_NAME}" > /tmp/sigaw-release-body.md
+          fi
+          if [[ ! -s /tmp/sigaw-release-body.md ]]; then
+            cat > /tmp/sigaw-release-body.md <<EOF
+            Release ${FORGEJO_REF_NAME}
+
+            Built from commit \`${FORGEJO_SHA}\`.
+            EOF
+          fi
+
+      - name: Publish Forgejo release
+        env:
+          FORGEJO_RELEASE_TOKEN: ${{ secrets.FORGEJO_RELEASE_TOKEN }}
+        run: |
+          contrib/ci/publish-forgejo-release.sh \
+            --tag "${FORGEJO_REF_NAME}" \
+            --title "Sigaw ${FORGEJO_REF_NAME#v}" \
+            --target "${FORGEJO_SHA}" \
+            --body-file /tmp/sigaw-release-body.md \
+            --asset-dir "${SIGAW_DIST_DIR}"

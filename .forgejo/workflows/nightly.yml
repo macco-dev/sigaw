@@ -1,0 +1,63 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  nightly:
+    runs-on: ubuntu-24.04-amd64
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      SIGAW_BUILD_DIR: /tmp/sigaw-nightly-build-${{ forgejo.run_number }}
+      SIGAW_STAGE_DIR: /tmp/sigaw-nightly-stage-${{ forgejo.run_number }}
+      SIGAW_DIST_DIR: /tmp/sigaw-nightly-dist-${{ forgejo.run_number }}
+    steps:
+      - name: Check out source
+        uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: contrib/ci/bootstrap-deps.sh
+
+      - name: Build, test, and stage install
+        run: contrib/ci/build-test-install.sh
+
+      - name: Package nightly assets
+        run: contrib/ci/package-artifacts.sh --version-label nightly
+
+      - name: Move nightly tag to current commit
+        run: |
+          git tag -f nightly "${FORGEJO_SHA}"
+          git push origin refs/tags/nightly --force
+
+      - name: Write nightly release notes
+        run: |
+          cat > /tmp/sigaw-nightly-body.md <<EOF
+          Nightly build from $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          Commit: \`${FORGEJO_SHA}\`
+          Subject: $(git log -1 --pretty=%s "${FORGEJO_SHA}")
+          EOF
+
+      - name: Publish nightly release
+        env:
+          FORGEJO_RELEASE_TOKEN: ${{ secrets.FORGEJO_RELEASE_TOKEN }}
+        run: |
+          contrib/ci/publish-forgejo-release.sh \
+            --tag nightly \
+            --title "Sigaw nightly" \
+            --target "${FORGEJO_SHA}" \
+            --body-file /tmp/sigaw-nightly-body.md \
+            --asset-dir "${SIGAW_DIST_DIR}" \
+            --prerelease
