@@ -34,32 +34,26 @@ Gamescope, and X11 Vulkan apps.
 ## Example Overlays
 
 Generated from the current renderer on a 3840x2160 test frame. Regenerate them
-with `meson compile -C build render-readme-screenshots`. Click any crop to open
-the full 4K frame.
+with `meson compile -C build render-readme-screenshots`.
 
-### Standard layout
-
-<a href="assets/screenshots/overlay-standard.png">
-  <img src="assets/screenshots/overlay-standard-detail.png" width="100%" alt="Standard Sigaw overlay with a channel header, speaker highlight, and inline mute and deaf icons." />
-</a>
-
-Channel header, live speaking state, and inline mute icons.
-
-### Compact mode
-
-<a href="assets/screenshots/overlay-compact.png">
-  <img src="assets/screenshots/overlay-compact-detail.png" width="100%" alt="Compact Sigaw overlay with avatar-only rows, a speaking ring, and mute badges." />
-</a>
-
-Avatar-first rows with badge indicators.
-
-### Larger channels
-
-<a href="assets/screenshots/overlay-overflow.png">
-  <img src="assets/screenshots/overlay-overflow-detail.png" width="100%" alt="Sigaw overlay showing a larger voice channel collapsed into a plus more row." />
-</a>
-
-Extra users collapse into a <code>+N more</code> row.
+<table>
+  <tr>
+    <td width="33%">
+      <img src="assets/screenshots/overlay-standard-detail.png" width="100%" alt="Standard Sigaw overlay with a channel header, speaker highlight, and inline mute and deaf icons." />
+    </td>
+    <td width="33%">
+      <img src="assets/screenshots/overlay-compact-detail.png" width="100%" alt="Compact Sigaw overlay with avatar-only rows, a speaking ring, and mute badges." />
+    </td>
+    <td width="33%">
+      <img src="assets/screenshots/overlay-overflow-detail.png" width="100%" alt="Sigaw overlay showing a larger voice channel collapsed into a plus more row." />
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Standard layout</strong><br/>Channel header, live speaking state, and inline mute icons.</td>
+    <td align="center"><strong>Compact mode</strong><br/>Avatar-first rows with badge indicators.</td>
+    <td align="center"><strong>Larger channels</strong><br/>Extra users collapse into a <code>+N more</code> row.</td>
+  </tr>
+</table>
 
 ## Limits
 

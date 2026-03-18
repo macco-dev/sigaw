@@ -53,7 +53,6 @@ enum class BackgroundStyle {
 };
 
 struct Scene {
-    std::string filename;
     std::string detail_filename;
     std::string channel_name;
     sigaw::Config config;
@@ -294,14 +293,45 @@ void composite(Image& dst, const Image& src, int x0, int y0) {
 }
 
 Rect detail_crop_rect(const sigaw::preview::Placement& placement, uint32_t panel_w, uint32_t panel_h,
-                      uint32_t screen_w, uint32_t screen_h) {
-    const uint32_t crop_w = std::min<uint32_t>(screen_w, std::max<uint32_t>(1400u, panel_w * 4u));
-    const uint32_t crop_h = std::min<uint32_t>(screen_h, std::max<uint32_t>(1000u, panel_h * 3u));
-    int x = placement.x - static_cast<int>((crop_w - panel_w) / 2u);
-    int y = placement.y - static_cast<int>((crop_h - panel_h) / 2u);
-    x = std::max(0, std::min(x, static_cast<int>(screen_w - crop_w)));
-    y = std::max(0, std::min(y, static_cast<int>(screen_h - crop_h)));
-    return {x, y, crop_w, crop_h};
+                      uint32_t screen_w, uint32_t screen_h,
+                      sigaw::OverlayPosition position) {
+    const uint32_t near_margin_x = std::max<uint32_t>(28u, panel_w / 12u);
+    const uint32_t near_margin_y = std::max<uint32_t>(28u, panel_h / 12u);
+    const uint32_t far_margin_x = std::max<uint32_t>(140u, panel_w);
+    const uint32_t far_margin_y = std::max<uint32_t>(110u, panel_h / 4u);
+
+    const uint32_t min_size = std::max(panel_w + near_margin_x + far_margin_x,
+                                       panel_h + near_margin_y + far_margin_y);
+    const uint32_t crop_size = std::min(std::min(screen_w, screen_h), min_size);
+
+    int x = 0;
+    int y = 0;
+    switch (position) {
+        case sigaw::OverlayPosition::TopLeft:
+            x = placement.x - static_cast<int>(near_margin_x);
+            y = placement.y - static_cast<int>(near_margin_y);
+            break;
+        case sigaw::OverlayPosition::TopRight:
+            x = placement.x + static_cast<int>(panel_w) + static_cast<int>(near_margin_x) -
+                static_cast<int>(crop_size);
+            y = placement.y - static_cast<int>(near_margin_y);
+            break;
+        case sigaw::OverlayPosition::BottomLeft:
+            x = placement.x - static_cast<int>(near_margin_x);
+            y = placement.y + static_cast<int>(panel_h) + static_cast<int>(near_margin_y) -
+                static_cast<int>(crop_size);
+            break;
+        case sigaw::OverlayPosition::BottomRight:
+            x = placement.x + static_cast<int>(panel_w) + static_cast<int>(near_margin_x) -
+                static_cast<int>(crop_size);
+            y = placement.y + static_cast<int>(panel_h) + static_cast<int>(near_margin_y) -
+                static_cast<int>(crop_size);
+            break;
+    }
+
+    x = std::max(0, std::min(x, static_cast<int>(screen_w - crop_size)));
+    y = std::max(0, std::min(y, static_cast<int>(screen_h - crop_size)));
+    return {x, y, crop_size, crop_size};
 }
 
 Image crop_image(const Image& src, const Rect& rect) {
@@ -405,7 +435,6 @@ std::vector<Scene> build_scenes() {
     std::vector<Scene> scenes;
 
     Scene standard;
-    standard.filename = "overlay-standard.png";
     standard.detail_filename = "overlay-standard-detail.png";
     standard.channel_name = "squad comms";
     standard.background = BackgroundStyle::Ember;
@@ -427,7 +456,6 @@ std::vector<Scene> build_scenes() {
     scenes.push_back(std::move(standard));
 
     Scene compact;
-    compact.filename = "overlay-compact.png";
     compact.detail_filename = "overlay-compact-detail.png";
     compact.channel_name = "party";
     compact.background = BackgroundStyle::Verdant;
@@ -447,7 +475,6 @@ std::vector<Scene> build_scenes() {
     scenes.push_back(std::move(compact));
 
     Scene overflow;
-    overflow.filename = "overlay-overflow.png";
     overflow.detail_filename = "overlay-overflow-detail.png";
     overflow.channel_name = "raid room";
     overflow.background = BackgroundStyle::Dusk;
@@ -569,7 +596,7 @@ int main(int argc, char** argv) {
 
             Image panel;
             if (!sigaw::preview::render_panel_rgba(state, scene.config, speaking_times_ms, panel)) {
-                std::cerr << "failed to render overlay panel for " << scene.filename << "\n";
+                std::cerr << "failed to render overlay panel for " << scene.detail_filename << "\n";
                 ok = false;
                 break;
             }
@@ -582,17 +609,12 @@ int main(int argc, char** argv) {
             );
             composite(screen, panel, placement.x, placement.y);
 
-            const auto out_path = output_dir / scene.filename;
-            if (!sigaw::preview::write_png(out_path, screen)) {
-                std::cerr << "failed to write screenshot: " << out_path << "\n";
-                ok = false;
-                break;
-            }
-            std::cout << "wrote " << out_path << "\n";
-
             const auto detail = crop_image(
                 screen,
-                detail_crop_rect(placement, panel.width, panel.height, screen.width, screen.height)
+                detail_crop_rect(
+                    placement, panel.width, panel.height,
+                    screen.width, screen.height, scene.config.position
+                )
             );
             const auto detail_path = output_dir / scene.detail_filename;
             if (!sigaw::preview::write_png(detail_path, detail)) {
