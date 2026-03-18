@@ -31,6 +31,7 @@ Gamescope, X11 Vulkan apps, and X11/EGL OpenGL apps.
 - Keeps active speakers visible when the channel is larger than the visible row limit
 - Can show the latest voice channel chat messages as fading overlay rows
 - Supports avatars, compact mode, and basic overlay placement controls
+- Exposes a system tray menu for quick overlay, chat, compact, reload, and daemon actions
 - Runs as a daemon plus Vulkan/OpenGL hooks, with `sigaw-ctl` for control and status
 
 ## Example Overlays
@@ -102,6 +103,17 @@ systemctl --user enable --now sigaw-daemon
 
 On first run, Discord should prompt for authorization.
 
+When started inside a graphical session with an AppIndicator/StatusNotifier
+host, `sigaw-daemon` also exposes a tray menu with:
+
+- Live Discord connection and current channel status
+- `Show overlay`
+- `Show voice messages`
+- `Compact mode`
+- `Open config`
+- `Reload config`
+- `Stop daemon`
+
 ### 4. Launch an app with Sigaw enabled
 
 ```bash
@@ -143,6 +155,8 @@ Build:
 
 - Vulkan headers and loader
 - OpenGL/EGL/X11 development files
+- GTK 3
+- Ayatana AppIndicator or AppIndicator 3 development files
 - Meson
 - Ninja
 - nlohmann-json
@@ -156,7 +170,7 @@ Package examples:
 
 ```bash
 sudo pacman -S vulkan-headers vulkan-icd-loader meson ninja \
-    nlohmann-json curl freetype2 libpng
+    nlohmann-json curl freetype2 libpng gtk3 libayatana-appindicator
 ```
 
 **Ubuntu / Debian**
@@ -164,7 +178,8 @@ sudo pacman -S vulkan-headers vulkan-icd-loader meson ninja \
 ```bash
 sudo apt install libvulkan-dev meson ninja-build \
     nlohmann-json3-dev libcurl4-openssl-dev \
-    libfreetype-dev libpng-dev
+    libfreetype-dev libpng-dev libgtk-3-dev \
+    libayatana-appindicator3-dev
 ```
 
 ## Configuration
@@ -199,6 +214,8 @@ scope the next time the daemon reconnects or reloads authentication.
 - `sigaw-ctl stop` stops the daemon
 - `sigaw-ctl config` prints the active config path
 
+The tray menu is additive. `sigaw-ctl` remains the scriptable control path.
+
 ## Troubleshooting
 
 If the overlay does not appear:
@@ -209,6 +226,11 @@ If the overlay does not appear:
 - Verify the daemon is running with `sigaw-ctl status`.
 - If you installed from source, confirm `sudo meson install -C build` completed successfully.
 - Avoid stacking another swap-buffer interposer on top of Sigaw.
+
+If the tray icon does not appear:
+
+- Confirm you started `sigaw-daemon` from a graphical user session.
+- Make sure your desktop environment exposes an AppIndicator or StatusNotifier host.
 
 If Discord never prompts for authorization:
 

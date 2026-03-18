@@ -63,6 +63,13 @@ curl_dep = dependency('libcurl', required: true)
 # Layer text/image rendering
 freetype_dep = dependency('freetype2', required: true)
 png_dep = dependency('libpng', required: true)
+gtk_dep = dependency('gtk+-3.0', required: true)
+ayatana_appindicator_dep = dependency('ayatana-appindicator3-0.1', required: false)
+use_ayatana_appindicator = ayatana_appindicator_dep.found()
+appindicator_dep = ayatana_appindicator_dep
+if not appindicator_dep.found()
+  appindicator_dep = dependency('appindicator3-0.1', required: true)
+endif
 glslang_validator = find_program('glslangValidator', required: true)
 
 overlay_quad_vert_spv = custom_target(
@@ -192,23 +199,42 @@ install_data(
   install_dir: get_option('datadir') / 'sigaw' / 'fonts',
 )
 
+install_data(
+  'assets/sigaw-logo.svg',
+  install_dir: get_option('datadir') / 'sigaw' / 'icons',
+)
+
 # --------------------------------------------------------------------------
 # Daemon (sigaw-daemon)
 # --------------------------------------------------------------------------
 
 daemon_sources = [
   'src/daemon/main.cpp',
+  'src/daemon/tray_actions.cpp',
+  'src/daemon/tray_icon.cpp',
   'src/layer/overlay_renderer.cpp',
 ]
 
-daemon_deps = [vulkan_dep, rt_dep, thread_dep, json_dep, curl_dep, freetype_dep, png_dep]
+daemon_deps = [
+  vulkan_dep,
+  rt_dep,
+  thread_dep,
+  json_dep,
+  curl_dep,
+  freetype_dep,
+  png_dep,
+  gtk_dep,
+  appindicator_dep,
+]
 
 daemon_bin = executable(
   'sigaw-daemon',
   daemon_sources,
   include_directories: include_directories('src'),
   dependencies: daemon_deps,
-  cpp_args: overlay_cpp_args,
+  cpp_args: overlay_cpp_args + [
+    '-DSIGAW_USE_AYATANA_APPINDICATOR=' + (use_ayatana_appindicator ? '1' : '0'),
+  ],
   install: true,
 )
 
@@ -424,6 +450,20 @@ test(
   daemon_voice_runtime_test,
 )
 
+tray_actions_test = executable(
+  'sigaw-tray-actions-test',
+  [
+    'tests/tray_actions_test.cpp',
+    'src/daemon/tray_actions.cpp',
+  ],
+  include_directories: include_directories('src'),
+)
+
+test(
+  'sigaw-tray-actions',
+  tray_actions_test,
+)
+
 launcher_env_test = executable(
   'sigaw-launcher-env-test',
   [
@@ -448,8 +488,10 @@ summary({
   'Daemon': true,
   'CLI tool': true,
   'Launcher': true,
+  'Tray': true,
   'libcurl (OAuth)': curl_dep.found(),
   'nlohmann/json': json_dep.found(),
   'FreeType': freetype_dep.found(),
   'libpng': png_dep.found(),
+  'AppIndicator backend': use_ayatana_appindicator ? 'Ayatana AppIndicator' : 'AppIndicator',
 }, section: 'Components')

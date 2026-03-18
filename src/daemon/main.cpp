@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <csignal>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <unistd.h>
 #include <getopt.h>
@@ -11,12 +12,16 @@
 #include <thread>
 #include <unordered_map>
 
+#include <glib.h>
+
 #include "avatar_cache.h"
 #include "chat_runtime.h"
 #include "control_server.h"
 #include "discord_ipc.h"
 #include "json_utils.h"
 #include "shm_writer.h"
+#include "tray_actions.h"
+#include "tray_icon.h"
 #include "voice_runtime.h"
 #include "../common/config.h"
 #include "../common/config_watcher.h"
@@ -32,6 +37,23 @@ static void signal_handler(int) {
     g_running = 0;
 }
 
+struct TrayLoopResult {
+    bool state_changed = false;
+    bool overlay_dirty = false;
+    bool reconnect_requested = false;
+    bool quit_requested = false;
+};
+
+static void update_tray(sigaw::tray::Icon* tray,
+                        const sigaw::Config& config,
+                        bool discord_connected,
+                        const sigaw::VoiceState& voice);
+static TrayLoopResult process_tray_actions(sigaw::tray::Icon* tray,
+                                           sigaw::Config& config,
+                                           bool have_messages_read_scope,
+                                           sigaw::VoiceRuntimeState* runtime = nullptr,
+                                           sigaw::DiscordIpc* ipc = nullptr);
+
 static bool daemon_requires_reconnect(const sigaw::Config& current,
                                       const sigaw::Config& updated,
                                       bool have_messages_read_scope = false)
@@ -45,9 +67,24 @@ static bool daemon_requires_reconnect(const sigaw::Config& current,
 
 static bool wait_with_control(sigaw::ControlServer& ctl, sigaw::Config& config,
                               sigaw::ConfigWatcher* config_watcher,
-                              int total_ms, bool* reconnect_requested = nullptr)
+                              int total_ms,
+                              sigaw::tray::Icon* tray = nullptr,
+                              bool* reconnect_requested = nullptr)
 {
+    const sigaw::VoiceState no_voice;
     for (int elapsed = 0; elapsed < total_ms && g_running; elapsed += 100) {
+        const auto tray_result = process_tray_actions(tray, config, false);
+        if (tray_result.quit_requested) {
+            g_running = 0;
+            return false;
+        }
+        if (tray_result.reconnect_requested) {
+            if (reconnect_requested) {
+                *reconnect_requested = true;
+            }
+            return false;
+        }
+
         if (config_watcher && config_watcher->consume_change()) {
             const auto updated = sigaw::Config::load();
             const bool reconnect = daemon_requires_reconnect(config, updated);
@@ -71,6 +108,7 @@ static bool wait_with_control(sigaw::ControlServer& ctl, sigaw::Config& config,
             }
             return false;
         }
+        update_tray(tray, config, false, no_voice);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return g_running != 0;
@@ -333,6 +371,116 @@ static bool refresh_chat_state(sigaw::VoiceRuntimeState& runtime,
     return had_chat || loaded_history;
 }
 
+static bool open_config_in_editor(const sigaw::Config& config) {
+    const auto path = sigaw::Config::config_path();
+    if (!std::filesystem::exists(path) && !config.save()) {
+        fprintf(stderr, "[sigaw] Failed to create config file before opening it\n");
+        return false;
+    }
+
+    std::string path_string = path.string();
+    char open_cmd[] = "xdg-open";
+    char* argv[] = {open_cmd, path_string.data(), nullptr};
+    GError* error = nullptr;
+    if (!g_spawn_async(nullptr,
+                       argv,
+                       nullptr,
+                       G_SPAWN_SEARCH_PATH,
+                       nullptr,
+                       nullptr,
+                       nullptr,
+                       &error)) {
+        fprintf(stderr, "[sigaw] Failed to launch xdg-open for %s: %s\n",
+                path_string.c_str(),
+                error ? error->message : "unknown error");
+        if (error) {
+            g_error_free(error);
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static void update_tray(sigaw::tray::Icon* tray,
+                        const sigaw::Config& config,
+                        bool discord_connected,
+                        const sigaw::VoiceState& voice)
+{
+    if (!tray || !tray->available()) {
+        return;
+    }
+
+    sigaw::tray::StatusSnapshot snapshot;
+    snapshot.discord_connected = discord_connected;
+    if (!voice.channel_id.empty()) {
+        snapshot.channel_name = voice.channel_name;
+        snapshot.user_count = voice.users.size();
+    }
+    snapshot.overlay_visible = config.visible;
+    snapshot.show_voice_messages = config.show_voice_channel_chat;
+    snapshot.compact_mode = config.compact;
+    tray->update(snapshot);
+}
+
+static TrayLoopResult process_tray_actions(sigaw::tray::Icon* tray,
+                                           sigaw::Config& config,
+                                           bool have_messages_read_scope,
+                                           sigaw::VoiceRuntimeState* runtime,
+                                           sigaw::DiscordIpc* ipc)
+{
+    TrayLoopResult result;
+    if (!tray || !tray->available()) {
+        return result;
+    }
+
+    tray->pump_events();
+
+    sigaw::tray::Action action;
+    while (tray->pop_action(action)) {
+        const auto planned = sigaw::tray::plan_action(
+            action,
+            config,
+            have_messages_read_scope
+        );
+
+        if (planned.updated_config) {
+            auto next = *planned.updated_config;
+            if (!next.save()) {
+                fprintf(stderr, "[sigaw] Failed to persist config after tray action\n");
+                continue;
+            }
+            config = std::move(next);
+            result.overlay_dirty = result.overlay_dirty || planned.overlay_dirty;
+        }
+
+        if (planned.open_config_requested) {
+            (void)open_config_in_editor(config);
+        }
+        if (planned.clear_chat_state && runtime) {
+            if (clear_chat_state(*runtime, ipc)) {
+                result.state_changed = true;
+            }
+            result.overlay_dirty = true;
+        }
+        if (planned.refresh_chat_state && runtime && ipc) {
+            const bool chat_changed = refresh_chat_state(*runtime, *ipc, config);
+            result.state_changed = result.state_changed || chat_changed;
+            result.overlay_dirty = true;
+        }
+        if (planned.reload_requested || planned.reconnect_requested) {
+            result.reconnect_requested = true;
+            break;
+        }
+        if (planned.stop_daemon) {
+            result.quit_requested = true;
+            break;
+        }
+    }
+
+    return result;
+}
+
 int main(int argc, char** argv) {
     bool foreground = true;
     bool init_config = false;
@@ -418,6 +566,11 @@ int main(int argc, char** argv) {
         sigaw::AvatarCache avatar_cache;
         sigaw::OverlayFrameWriter overlay_frame;
         const sigaw::VoiceSyncConfig sync_config{};
+        sigaw::tray::Icon tray;
+        (void)tray.open();
+
+        const sigaw::VoiceState no_voice;
+        update_tray(&tray, config, false, no_voice);
 
         /* Main reconnection loop */
         while (g_running) {
@@ -427,13 +580,13 @@ int main(int argc, char** argv) {
 
             if (!ipc.connect()) {
                 fprintf(stderr, "[sigaw] Discord not found, retrying in 5s...\n");
-                wait_with_control(ctl, config, &config_watcher, 5000);
+                wait_with_control(ctl, config, &config_watcher, 5000, &tray);
                 continue;
             }
 
             if (!ipc.handshake()) {
                 fprintf(stderr, "[sigaw] Handshake failed, retrying in 5s...\n");
-                wait_with_control(ctl, config, &config_watcher, 5000);
+                wait_with_control(ctl, config, &config_watcher, 5000, &tray);
                 continue;
             }
 
@@ -447,7 +600,7 @@ int main(int argc, char** argv) {
             if (!authorized) {
                 fprintf(stderr, "[sigaw] Auth failed (check client_id/secret)\n");
                 fprintf(stderr, "[sigaw] Retrying in 10s...\n");
-                wait_with_control(ctl, config, &config_watcher, 10000);
+                wait_with_control(ctl, config, &config_watcher, 10000, &tray);
                 continue;
             }
 
@@ -480,6 +633,7 @@ int main(int argc, char** argv) {
             (void)refresh_chat_state(runtime, ipc, config);
             update_shm(shm, runtime.voice, avatar_cache);
             publish_overlay_frame(overlay_frame, runtime.voice, config);
+            update_tray(&tray, config, true, runtime.voice);
 
             /* Event loop */
             fprintf(stderr, "[sigaw] Listening for voice events...\n");
@@ -489,6 +643,24 @@ int main(int argc, char** argv) {
                 bool state_changed = false;
                 bool overlay_dirty = false;
                 bool closed = false;
+
+                const auto tray_result = process_tray_actions(
+                    &tray,
+                    config,
+                    ipc.has_scope("messages.read"),
+                    &runtime,
+                    &ipc
+                );
+                if (tray_result.quit_requested) {
+                    g_running = 0;
+                    break;
+                }
+                if (tray_result.reconnect_requested) {
+                    reconnect_requested = true;
+                    break;
+                }
+                state_changed = state_changed || tray_result.state_changed;
+                overlay_dirty = overlay_dirty || tray_result.overlay_dirty;
 
                 int timeout_ms = 250;
                 const auto timeout_now = std::chrono::steady_clock::now();
@@ -607,6 +779,8 @@ int main(int argc, char** argv) {
                     if (reconnect_requested) {
                         break;
                     }
+                    const bool chat_changed = refresh_chat_state(runtime, ipc, config);
+                    state_changed = state_changed || chat_changed;
                     overlay_dirty = true;
                 }
 
@@ -630,6 +804,7 @@ int main(int argc, char** argv) {
                 if (overlay_dirty) {
                     publish_overlay_frame(overlay_frame, runtime.voice, config);
                 }
+                update_tray(&tray, config, true, runtime.voice);
             }
 
             fprintf(stderr, "[sigaw] Disconnected, reconnecting...\n");
@@ -638,13 +813,14 @@ int main(int argc, char** argv) {
             runtime = {};
             update_shm(shm, runtime.voice, avatar_cache);
             publish_overlay_frame(overlay_frame, runtime.voice, config);
+            update_tray(&tray, config, false, runtime.voice);
 
             if (!g_running) {
                 break;
             }
 
             if (!reconnect_requested) {
-                wait_with_control(ctl, config, &config_watcher, 2000);
+                wait_with_control(ctl, config, &config_watcher, 2000, &tray);
             }
         }
     }
