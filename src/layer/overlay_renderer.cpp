@@ -25,8 +25,9 @@
 #include "overlay_runtime.h"
 #include "overlay_visibility.h"
 #include "../common/config.h"
-#include "../common/overlay_frame_shm.h"
+#include "../common/config_watcher.h"
 #include "../common/protocol.h"
+#include "shm_reader.h"
 
 extern "C" {
 struct SigawOverlayContext;
@@ -1991,49 +1992,139 @@ bool write_png(const std::filesystem::path& path, const Image& image)
 namespace sigaw::overlay {
 
 struct Runtime::Impl {
-    sigaw::OverlayFrameReader frame_reader;
-    sigaw::OverlayFrameSnapshot frame;
-    bool have_frame = false;
+    sigaw::ShmReader shm;
+    sigaw::Config cfg;
+    sigaw::ConfigWatcher cfg_watch;
+    PBuf panel;
+    TextSystem text;
+    AvatarStore avatars;
+    std::unordered_map<uint64_t, float> speaking_times_ms;
+    std::chrono::steady_clock::time_point last_speaking_tick = {};
+    std::vector<uint8_t> rgba;
+    uint64_t frame_sequence = 0;
     bool debug = std::getenv("SIGAW_DEBUG") != nullptr;
+
+    void refresh_config(bool force = false) {
+        if (force) {
+            cfg = sigaw::Config::load_for_executable(sigaw::Config::current_executable_basename());
+            cfg_watch.sync();
+            return;
+        }
+
+        if (cfg_watch.consume_change()) {
+            cfg = sigaw::Config::load_for_executable(sigaw::Config::current_executable_basename());
+        }
+    }
+
+    void reset_speaking_animation() {
+        speaking_times_ms.clear();
+        last_speaking_tick = {};
+    }
+
+    float speaking_frame_delta_ms(std::chrono::steady_clock::time_point now) {
+        float dt_ms = 0.0f;
+        if (last_speaking_tick != std::chrono::steady_clock::time_point{}) {
+            dt_ms = std::chrono::duration<float, std::milli>(now - last_speaking_tick).count();
+        }
+        last_speaking_tick = now;
+        return std::clamp(dt_ms, 0.0f, sigaw::overlay::speaking_fade_ms);
+    }
+
+    void update_speaking_animation(const SigawState& vs, float dt_ms) {
+        for (uint32_t i = 0; i < vs.user_count; ++i) {
+            const auto& user = vs.users[i];
+            auto& progress_ms = speaking_times_ms[user.user_id];
+            progress_ms = sigaw::overlay::advance_speaking_time(
+                progress_ms,
+                user.speaking != 0,
+                dt_ms
+            );
+        }
+
+        for (auto it = speaking_times_ms.begin(); it != speaking_times_ms.end();) {
+            bool present = false;
+            for (uint32_t i = 0; i < vs.user_count; ++i) {
+                if (vs.users[i].user_id == it->first) {
+                    present = true;
+                    break;
+                }
+            }
+
+            if (!present) {
+                it = speaking_times_ms.erase(it);
+                continue;
+            }
+
+            ++it;
+        }
+    }
 
     PreparedFrame prepare(uint32_t surface_width, uint32_t surface_height) {
         PreparedFrame out;
+
+        refresh_config();
         if (surface_width == 0 || surface_height == 0) {
             return out;
         }
 
-        bool changed = false;
-        const bool available = frame_reader.read(frame, &changed);
-        if (!available) {
-            if (!frame_reader.is_connected()) {
-                have_frame = false;
-                frame = {};
-            }
-            if (debug) {
-                fprintf(stderr, "[sigaw] Debug: overlay frame unavailable\n");
-            }
+        if (!cfg.visible) {
             return out;
         }
 
-        have_frame = true;
-        if (!frame.visible || frame.width == 0 || frame.height == 0 || frame.rgba.empty()) {
-            return out;
-        }
-
-        out.placement = panel_placement(
-            frame.position, frame.margin_px, frame.width, frame.height, surface_width, surface_height
+        SigawState vs = {};
+        const bool have_voice_state = shm.read(vs);
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t now_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count()
         );
-        out.rgba = frame.rgba.data();
-        out.width = frame.width;
-        out.height = frame.height;
-        out.byte_size = frame.rgba.size();
-        out.sequence = frame.sequence;
-        out.changed = changed;
+        if (debug && !have_voice_state) {
+            fprintf(stderr, "[sigaw] Debug: shared memory read unavailable, rendering fallback panel\n");
+        }
+
+        if (have_voice_state) {
+            update_speaking_animation(vs, speaking_frame_delta_ms(now));
+        } else if (!shm.is_connected()) {
+            reset_speaking_animation();
+        }
+
+        build_panel(vs, cfg, panel, text, avatars, speaking_times_ms, now_ms);
+        if (panel.p.empty() || panel.w == 0 || panel.h == 0) {
+            return out;
+        }
+
+        const auto placement = panel_placement(cfg, panel.w, panel.h, surface_width, surface_height);
+        const uint32_t crop_w = std::min(panel.w, surface_width - static_cast<uint32_t>(placement.x));
+        const uint32_t crop_h = std::min(panel.h, surface_height - static_cast<uint32_t>(placement.y));
+        if (crop_w == 0 || crop_h == 0) {
+            return out;
+        }
+
+        rgba.resize(static_cast<size_t>(crop_w) * crop_h * 4u);
+        for (uint32_t y = 0; y < crop_h; ++y) {
+            for (uint32_t x = 0; x < crop_w; ++x) {
+                const auto& src = panel.p[static_cast<size_t>(y) * panel.w + x];
+                const size_t idx = (static_cast<size_t>(y) * crop_w + x) * 4u;
+                rgba[idx + 0] = src.r;
+                rgba[idx + 1] = src.g;
+                rgba[idx + 2] = src.b;
+                rgba[idx + 3] = src.a;
+            }
+        }
+
+        out.placement = placement;
+        out.rgba = rgba.data();
+        out.width = crop_w;
+        out.height = crop_h;
+        out.byte_size = rgba.size();
+        out.sequence = ++frame_sequence;
+        out.changed = true;
         return out;
     }
 };
 
-Runtime::Runtime() : impl_(std::make_unique<Impl>()) {}
+Runtime::Runtime() : impl_(std::make_unique<Impl>()) {
+    impl_->refresh_config(true);
+}
 
 Runtime::~Runtime() = default;
 

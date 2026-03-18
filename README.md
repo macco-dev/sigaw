@@ -201,6 +201,19 @@ Sigaw keeps its config in `~/.config/sigaw/sigaw.conf`.
 
 Example config: [`sigaw.conf.example`](sigaw.conf.example).
 
+Sigaw also supports per-game overlay profiles in the same file:
+
+```ini
+[profile:vkcube]
+position=bottom-left
+compact=true
+show_voice_channel_chat=true
+```
+
+Profile matching is exact and case-sensitive, using the hooked process basename
+from `/proc/self/exe`. Profiles override overlay settings only; Discord
+credentials remain global.
+
 When `show_voice_channel_chat=true`, Sigaw will request Discord's `messages.read`
 scope the next time the daemon reconnects or reloads authentication.
 

@@ -46,3 +46,16 @@ visible=true
 
 client_id=1483519089719640105
 client_secret=HD2VNfR0HxOiLSMM842PMDDv-SbW1r6Z
+
+# ---- Optional Per-Game Overlay Profiles ----
+#
+# Match on the exact executable basename from /proc/self/exe.
+# These sections override overlay settings only. Discord credentials remain global.
+#
+# Example: launch `sigaw-run vkcube` or `SIGAW=1 vkcube` and Sigaw will apply
+# the matching [profile:vkcube] section inside that hooked process.
+
+[profile:vkcube]
+position=bottom-left
+compact=true
+show_voice_channel_chat=true

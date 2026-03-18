@@ -10,7 +10,6 @@
 #include <chrono>
 #include <poll.h>
 #include <thread>
-#include <unordered_map>
 
 #include <glib.h>
 
@@ -25,11 +24,7 @@
 #include "voice_runtime.h"
 #include "../common/config.h"
 #include "../common/config_watcher.h"
-#include "../common/overlay_frame_shm.h"
 #include "../common/protocol.h"
-#include "../layer/overlay_animation.h"
-#include "../layer/overlay_layout.h"
-#include "../layer/overlay_preview.h"
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -39,7 +34,6 @@ static void signal_handler(int) {
 
 struct TrayLoopResult {
     bool state_changed = false;
-    bool overlay_dirty = false;
     bool reconnect_requested = false;
     bool quit_requested = false;
 };
@@ -184,117 +178,6 @@ static void update_shm(sigaw::ShmWriter& shm,
     }
 
     shm.end_write();
-}
-
-static SigawState make_overlay_state(const sigaw::VoiceState& voice) {
-    SigawState state = {};
-    state.header.magic = SIGAW_MAGIC;
-    state.header.version = SIGAW_VERSION;
-    if (voice.channel_id.empty()) {
-        return state;
-    }
-
-    const size_t channel_len = std::min(
-        voice.channel_name.size(),
-        sizeof(state.header.channel_name) - 1
-    );
-    std::memcpy(state.header.channel_name, voice.channel_name.data(), channel_len);
-    state.header.channel_name[channel_len] = '\0';
-    state.header.channel_name_len = static_cast<uint32_t>(channel_len);
-
-    const uint32_t count = std::min(
-        static_cast<uint32_t>(voice.users.size()),
-        static_cast<uint32_t>(SIGAW_MAX_USERS)
-    );
-    state.user_count = count;
-
-    for (uint32_t i = 0; i < count; ++i) {
-        const auto& src = voice.users[i];
-        auto& dst = state.users[i];
-        dst.user_id = src.id;
-        std::strncpy(dst.username, src.username.c_str(), sizeof(dst.username) - 1);
-        dst.username[sizeof(dst.username) - 1] = '\0';
-        std::strncpy(dst.avatar_hash, src.avatar.c_str(), sizeof(dst.avatar_hash) - 1);
-        dst.avatar_hash[sizeof(dst.avatar_hash) - 1] = '\0';
-        dst.speaking = src.speaking ? 1u : 0u;
-        dst.self_mute = src.self_mute ? 1u : 0u;
-        dst.self_deaf = src.self_deaf ? 1u : 0u;
-        dst.server_mute = src.server_mute ? 1u : 0u;
-        dst.server_deaf = src.server_deaf ? 1u : 0u;
-        dst.suppress = 0u;
-    }
-
-    const uint32_t chat_count = std::min(
-        static_cast<uint32_t>(voice.chat_messages.size()),
-        static_cast<uint32_t>(SIGAW_MAX_CHAT_MESSAGES)
-    );
-    state.chat_count = chat_count;
-    for (uint32_t i = 0; i < chat_count; ++i) {
-        const auto& src = voice.chat_messages[i];
-        auto& dst = state.chat_messages[i];
-        dst.message_id = src.id;
-        dst.author_id = src.author_id;
-        dst.observed_at_ms = src.observed_at_ms;
-
-        const size_t author_len = std::min(src.author_name.size(), sizeof(dst.author_name) - 1);
-        std::memcpy(dst.author_name, src.author_name.data(), author_len);
-        dst.author_name[author_len] = '\0';
-        dst.author_name_len = static_cast<uint32_t>(author_len);
-
-        const size_t content_len = std::min(src.content.size(), sizeof(dst.content) - 1);
-        std::memcpy(dst.content, src.content.data(), content_len);
-        dst.content[content_len] = '\0';
-        dst.content_len = static_cast<uint32_t>(content_len);
-    }
-
-    return state;
-}
-
-static std::unordered_map<uint64_t, float>
-speaking_overlay_times(const sigaw::VoiceState& voice)
-{
-    std::unordered_map<uint64_t, float> times;
-    for (const auto& user : voice.users) {
-        if (user.speaking) {
-            times[user.id] = sigaw::overlay::speaking_fade_ms;
-        }
-    }
-    return times;
-}
-
-static sigaw::OverlayFrameSnapshot
-build_overlay_frame(const sigaw::VoiceState& voice, const sigaw::Config& config)
-{
-    sigaw::OverlayFrameSnapshot frame;
-    frame.position = config.position;
-    frame.margin_px = static_cast<uint32_t>(sigaw::overlay::scaled_px(config.scale, 16));
-    if (!config.visible || voice.channel_id.empty()) {
-        return frame;
-    }
-
-    const SigawState state = make_overlay_state(voice);
-    sigaw::preview::Image image;
-    if (!sigaw::preview::render_panel_rgba(
-            state, config, speaking_overlay_times(voice), image
-        )) {
-        return frame;
-    }
-
-    frame.visible = image.width != 0 && image.height != 0 && !image.rgba.empty();
-    frame.width = image.width;
-    frame.height = image.height;
-    frame.stride = image.width * 4u;
-    frame.rgba = std::move(image.rgba);
-    return frame;
-}
-
-static void publish_overlay_frame(sigaw::OverlayFrameWriter& writer,
-                                  const sigaw::VoiceState& voice,
-                                  const sigaw::Config& config)
-{
-    if (!writer.publish(build_overlay_frame(voice, config))) {
-        fprintf(stderr, "[sigaw] Failed to publish overlay frame\n");
-    }
 }
 
 static bool chat_requested(const sigaw::Config& config) {
@@ -451,7 +334,6 @@ static TrayLoopResult process_tray_actions(sigaw::tray::Icon* tray,
                 continue;
             }
             config = std::move(next);
-            result.overlay_dirty = result.overlay_dirty || planned.overlay_dirty;
         }
 
         if (planned.open_config_requested) {
@@ -461,12 +343,10 @@ static TrayLoopResult process_tray_actions(sigaw::tray::Icon* tray,
             if (clear_chat_state(*runtime, ipc)) {
                 result.state_changed = true;
             }
-            result.overlay_dirty = true;
         }
         if (planned.refresh_chat_state && runtime && ipc) {
             const bool chat_changed = refresh_chat_state(*runtime, *ipc, config);
             result.state_changed = result.state_changed || chat_changed;
-            result.overlay_dirty = true;
         }
         if (planned.reload_requested || planned.reconnect_requested) {
             result.reconnect_requested = true;
@@ -564,7 +444,6 @@ int main(int argc, char** argv) {
 
     {
         sigaw::AvatarCache avatar_cache;
-        sigaw::OverlayFrameWriter overlay_frame;
         const sigaw::VoiceSyncConfig sync_config{};
         sigaw::tray::Icon tray;
         (void)tray.open();
@@ -632,7 +511,6 @@ int main(int argc, char** argv) {
 
             (void)refresh_chat_state(runtime, ipc, config);
             update_shm(shm, runtime.voice, avatar_cache);
-            publish_overlay_frame(overlay_frame, runtime.voice, config);
             update_tray(&tray, config, true, runtime.voice);
 
             /* Event loop */
@@ -641,7 +519,6 @@ int main(int argc, char** argv) {
             bool reconnect_requested = false;
             while (g_running && ipc.is_connected()) {
                 bool state_changed = false;
-                bool overlay_dirty = false;
                 bool closed = false;
 
                 const auto tray_result = process_tray_actions(
@@ -660,7 +537,6 @@ int main(int argc, char** argv) {
                     break;
                 }
                 state_changed = state_changed || tray_result.state_changed;
-                overlay_dirty = overlay_dirty || tray_result.overlay_dirty;
 
                 int timeout_ms = 250;
                 const auto timeout_now = std::chrono::steady_clock::now();
@@ -716,7 +592,6 @@ int main(int argc, char** argv) {
                                     SIGAW_MAX_CHAT_MESSAGES
                                 )) {
                                 state_changed = true;
-                                overlay_dirty = true;
                             }
                         } else {
                             const auto update = sigaw::process_voice_event(
@@ -753,20 +628,14 @@ int main(int argc, char** argv) {
                 state_changed = state_changed || sync_update.state_changed;
                 const bool chat_state_changed = refresh_chat_state(runtime, ipc, config);
                 state_changed = state_changed || chat_state_changed;
-                overlay_dirty = overlay_dirty || chat_state_changed;
 
                 const uint64_t now_ms = sigaw::chat::steady_clock_now_ms();
                 if (sigaw::chat::prune_expired_messages(runtime.voice, now_ms)) {
                     state_changed = true;
-                    overlay_dirty = true;
-                }
-                if (sigaw::chat::repaint_due(runtime.voice, now_ms)) {
-                    overlay_dirty = true;
                 }
 
                 if (state_changed) {
                     update_shm(shm, runtime.voice, avatar_cache);
-                    overlay_dirty = true;
                 }
 
                 if (config_watcher.consume_change()) {
@@ -781,7 +650,6 @@ int main(int argc, char** argv) {
                     }
                     const bool chat_changed = refresh_chat_state(runtime, ipc, config);
                     state_changed = state_changed || chat_changed;
-                    overlay_dirty = true;
                 }
 
                 const auto action = ctl.process_pending(config);
@@ -789,21 +657,13 @@ int main(int argc, char** argv) {
                     g_running = 0;
                     break;
                 }
-                if (action == sigaw::ControlServer::Action::Refresh) {
-                    overlay_dirty = true;
-                }
                 if (action == sigaw::ControlServer::Action::Reload) {
                     reconnect_requested = true;
                     break;
                 }
 
-                if (avatar_cache.consume_dirty()) {
-                    overlay_dirty = true;
-                }
+                (void)avatar_cache.consume_dirty();
 
-                if (overlay_dirty) {
-                    publish_overlay_frame(overlay_frame, runtime.voice, config);
-                }
                 update_tray(&tray, config, true, runtime.voice);
             }
 
@@ -812,7 +672,6 @@ int main(int argc, char** argv) {
             /* Clear voice state on disconnect */
             runtime = {};
             update_shm(shm, runtime.voice, avatar_cache);
-            publish_overlay_frame(overlay_frame, runtime.voice, config);
             update_tray(&tray, config, false, runtime.voice);
 
             if (!g_running) {

@@ -87,6 +87,95 @@ bool test_chat_message_count_is_clamped() {
     return true;
 }
 
+bool test_profile_overrides_apply_per_executable() {
+    ConfigEnvGuard guard(unique_config_path());
+    write_file(
+        guard.path_,
+        "position=top-right\n"
+        "compact=false\n"
+        "show_voice_channel_chat=false\n"
+        "client_id=global-client\n"
+        "\n"
+        "[profile:vkcube]\n"
+        "position=bottom-left\n"
+        "compact=true\n"
+        "show_voice_channel_chat=true\n"
+        "client_id=ignored-in-profile\n"
+        "\n"
+        "[profile:other-game]\n"
+        "position=top-left\n"
+    );
+
+    const auto global = sigaw::Config::load();
+    if (global.position != sigaw::OverlayPosition::TopRight ||
+        global.compact ||
+        global.show_voice_channel_chat ||
+        global.client_id != "global-client") {
+        std::cerr << "global config should ignore profile-only overrides\n";
+        return false;
+    }
+
+    const auto vkcube = sigaw::Config::load_for_executable("vkcube");
+    if (vkcube.position != sigaw::OverlayPosition::BottomLeft ||
+        !vkcube.compact ||
+        !vkcube.show_voice_channel_chat ||
+        vkcube.client_id != "global-client") {
+        std::cerr << "matching executable should inherit globals and apply overlay profile keys\n";
+        return false;
+    }
+
+    const auto missing = sigaw::Config::load_for_executable("missing-game");
+    if (missing.position != sigaw::OverlayPosition::TopRight ||
+        missing.compact ||
+        missing.show_voice_channel_chat) {
+        std::cerr << "non-matching executable should fall back to global settings\n";
+        return false;
+    }
+
+    return true;
+}
+
+bool test_save_preserves_profile_sections_and_comments() {
+    ConfigEnvGuard guard(unique_config_path());
+    write_file(
+        guard.path_,
+        "# custom comment\n"
+        "position=top-right\n"
+        "\n"
+        "[profile:vkcube]\n"
+        "compact=true\n"
+        "# keep me\n"
+    );
+
+    auto cfg = sigaw::Config::load();
+    cfg.visible = false;
+    if (!cfg.save()) {
+        std::cerr << "failed to save config with profile sections\n";
+        return false;
+    }
+
+    std::ifstream in(guard.path_);
+    const std::string saved((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+    if (saved.find("# custom comment") == std::string::npos ||
+        saved.find("[profile:vkcube]") == std::string::npos ||
+        saved.find("compact=true") == std::string::npos ||
+        saved.find("# keep me") == std::string::npos) {
+        std::cerr << "saving globals should preserve existing comments and profile sections\n";
+        return false;
+    }
+
+    const auto visible_pos = saved.find("visible=false");
+    const auto profile_pos = saved.find("[profile:vkcube]");
+    if (visible_pos == std::string::npos || profile_pos == std::string::npos ||
+        visible_pos > profile_pos) {
+        std::cerr << "new global keys should be inserted before the first profile section\n";
+        return false;
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -94,6 +183,12 @@ int main() {
         return 1;
     }
     if (!test_chat_message_count_is_clamped()) {
+        return 1;
+    }
+    if (!test_profile_overrides_apply_per_executable()) {
+        return 1;
+    }
+    if (!test_save_preserves_profile_sections_and_comments()) {
         return 1;
     }
     return 0;
