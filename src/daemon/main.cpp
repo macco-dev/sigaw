@@ -252,29 +252,16 @@ static bool refresh_chat_state(sigaw::VoiceRuntimeState& runtime,
     const bool had_chat = clear_chat_state(runtime, &ipc);
     runtime.active_chat_channel_id = runtime.voice.channel_id;
 
-    json history = json::array();
-    bool loaded_history = false;
-    if (!ipc.get_channel_messages(runtime.voice.channel_id, SIGAW_MAX_CHAT_MESSAGES, history)) {
-        fprintf(stderr,
-                "[sigaw] Voice channel chat history unavailable for %s; continuing with live updates only\n",
-                runtime.voice.channel_name.c_str());
-    } else {
-        const uint64_t now_ms = sigaw::chat::steady_clock_now_ms();
-        loaded_history = sigaw::chat::load_chat_history(
-            runtime.voice, history, now_ms, SIGAW_MAX_CHAT_MESSAGES
-        );
-    }
-
     if (!ipc.subscribe_channel_messages(runtime.voice.channel_id)) {
         fprintf(stderr,
                 "[sigaw] Voice channel chat live updates unavailable for %s\n",
                 runtime.voice.channel_name.c_str());
-        return had_chat || loaded_history;
+        return had_chat;
     }
 
     runtime.subscribed_chat_channel_id = runtime.voice.channel_id;
     runtime.live_chat_events = true;
-    return had_chat || loaded_history;
+    return had_chat;
 }
 
 static bool open_config_in_editor(const sigaw::Config& config) {
