@@ -186,18 +186,18 @@ sudo apt install libvulkan-dev meson ninja-build \
 
 Sigaw keeps its config in `~/.config/sigaw/sigaw.conf`.
 
-| Option              | Default     | Description                                                            |
-| ------------------- | ----------- | ---------------------------------------------------------------------- |
-| `position`          | `top-right` | Overlay anchor: `top-left`, `top-right`, `bottom-left`, `bottom-right` |
-| `scale`             | `1.0`       | Overall size multiplier                                                |
-| `opacity`           | `0.72`      | Overlay opacity from `0.0` to `1.0`                                    |
-| `show_avatars`      | `true`      | Show Discord avatars when available                                    |
-| `show_channel_name` | `false`     | Show a channel header above the user list                              |
-| `show_voice_channel_chat` | `false` | Show the latest voice channel chat messages below the user list         |
-| `compact`           | `false`     | Render a smaller avatar-first layout                                   |
-| `max_visible_users` | `8`         | Maximum rows shown before collapsing the rest into `+N more`           |
-| `max_visible_chat_messages` | `4`  | Maximum fading voice channel chat rows shown at once                   |
-| `visible`           | `true`      | Persisted overlay visibility, usually managed by `sigaw-ctl`           |
+| Option                      | Default     | Description                                                            |
+| --------------------------- | ----------- | ---------------------------------------------------------------------- |
+| `position`                  | `top-right` | Overlay anchor: `top-left`, `top-right`, `bottom-left`, `bottom-right` |
+| `scale`                     | `1.0`       | Overall size multiplier                                                |
+| `opacity`                   | `0.72`      | Overlay opacity from `0.0` to `1.0`                                    |
+| `show_avatars`              | `true`      | Show Discord avatars when available                                    |
+| `show_channel_name`         | `false`     | Show a channel header above the user list                              |
+| `show_voice_channel_chat`   | `false`     | Show the latest voice channel chat messages below the user list        |
+| `compact`                   | `false`     | Render a smaller avatar-first layout                                   |
+| `max_visible_users`         | `8`         | Maximum rows shown before collapsing the rest into `+N more`           |
+| `max_visible_chat_messages` | `4`         | Maximum fading voice channel chat rows shown at once                   |
+| `visible`                   | `true`      | Persisted overlay visibility, usually managed by `sigaw-ctl`           |
 
 Example config: [`sigaw.conf.example`](sigaw.conf.example).
 
@@ -212,8 +212,7 @@ show_voice_channel_chat=true
 
 Profile matching is exact and case-sensitive, using the hooked process basename.
 On Wine/Proton, Sigaw matches the Windows game executable basename instead of
-`wine-preloader`. Profiles override overlay settings only; Discord credentials
-remain global.
+`wine-preloader`. Profiles override overlay settings only.
 
 When the global config or any profile enables `show_voice_channel_chat`, Sigaw
 will request Discord's `messages.read` scope the next time the daemon reconnects
@@ -228,8 +227,6 @@ or reloads authentication.
 - `sigaw-ctl reload` reloads the config file
 - `sigaw-ctl stop` stops the daemon
 - `sigaw-ctl config` prints the active config path
-
-The tray menu is additive. `sigaw-ctl` remains the scriptable control path.
 
 ## Troubleshooting
 
@@ -247,11 +244,6 @@ If the tray icon does not appear:
 
 - Confirm you started `sigaw-daemon` from a graphical user session.
 - Make sure your desktop environment exposes an AppIndicator or StatusNotifier host.
-
-If Discord never prompts for authorization:
-
-- Re-check `client_id` and `client_secret`.
-- Keep the Discord desktop client open while starting `sigaw-daemon`.
 
 If you need daemon logs:
 
