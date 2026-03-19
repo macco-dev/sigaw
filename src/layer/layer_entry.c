@@ -47,6 +47,11 @@ SigawOverlayContext* sigaw_overlay_create(VkDevice device, VkPhysicalDevice phys
 void sigaw_overlay_destroy(SigawOverlayContext* ctx);
 void sigaw_overlay_resize(SigawOverlayContext* ctx, VkFormat format,
                           uint32_t width, uint32_t height);
+VkSemaphore sigaw_overlay_acquire_present_semaphore(SigawOverlayContext* ctx);
+void sigaw_overlay_recycle_present_semaphore(SigawOverlayContext* ctx,
+                                             VkSemaphore semaphore);
+void sigaw_overlay_discard_present_semaphore(SigawOverlayContext* ctx,
+                                             VkSemaphore semaphore);
 int sigaw_overlay_render(SigawOverlayContext* ctx, VkQueue queue,
                          VkImage target_image, VkFormat format,
                          uint32_t width, uint32_t height,
@@ -97,6 +102,7 @@ typedef struct {
     PFN_vkQueueSubmit           queue_submit;
     PFN_vkDeviceWaitIdle        device_wait_idle;
     PFN_vkAcquireNextImageKHR   acquire_next_image;
+    PFN_vkAcquireNextImage2KHR  acquire_next_image2;
     uint32_t                    gfx_queue_family;
     VkQueue                     gfx_queue;
     VkQueue                     queues[MAX_DEVICE_QUEUES];
@@ -122,6 +128,24 @@ static int           g_device_count = 0;
 static SwapchainData g_swapchains[MAX_DEVICES * 4]; /* multiple swapchains per device */
 static int           g_swapchain_count = 0;
 static int           g_swapchain_full_warned = 0;
+
+static void clear_swapchain_present_tracking(DeviceData* dev, SwapchainData* sc);
+static void clear_device_present_tracking(DeviceData* dev);
+static void wait_for_swapchain_present_tracking(DeviceData* dev, SwapchainData* sc);
+static void wait_for_device_present_tracking(DeviceData* dev);
+static void recycle_swapchain_present_semaphore(DeviceData* dev,
+                                                SwapchainData* sc,
+                                                uint32_t image_index);
+static void discard_swapchain_present_semaphore(DeviceData* dev,
+                                                SwapchainData* sc,
+                                                uint32_t image_index);
+static void track_swapchain_present_semaphore(DeviceData* dev,
+                                              SwapchainData* sc,
+                                              uint32_t image_index,
+                                              VkSemaphore semaphore);
+static PFN_vkAcquireNextImage2KHR resolve_acquire_next_image2(
+    PFN_vkGetDeviceProcAddr get_device_proc,
+    VkDevice device);
 
 /* Lookup helpers */
 static InstanceData* find_instance(VkInstance inst) {
@@ -217,6 +241,8 @@ static void disable_overlay(DeviceData* dev, const char* message) {
     }
 
     if (dev->overlay_ctx) {
+        wait_for_device_present_tracking(dev);
+        clear_device_present_tracking(dev);
         sigaw_overlay_destroy(dev->overlay_ctx);
         dev->overlay_ctx = NULL;
     }
@@ -254,6 +280,234 @@ static int overlay_supports_format(VkFormat format) {
         default:
             return 0;
     }
+}
+
+static int device_tracks_present_wait_semaphore(VkDevice device,
+                                                VkSemaphore semaphore) {
+    if (device == VK_NULL_HANDLE || semaphore == VK_NULL_HANDLE) {
+        return 0;
+    }
+
+    for (int i = 0; i < g_swapchain_count; ++i) {
+        SwapchainData* sc = &g_swapchains[i];
+        if (sc->swapchain == VK_NULL_HANDLE || sc->device != device ||
+            !sc->present_wait_sems) {
+            continue;
+        }
+
+        for (uint32_t image_index = 0; image_index < sc->image_count; ++image_index) {
+            if (sc->present_wait_sems[image_index] == semaphore) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int swapchain_has_tracked_present_wait_semaphores(const SwapchainData* sc) {
+    if (!sc || !sc->present_wait_sems) {
+        return 0;
+    }
+
+    for (uint32_t image_index = 0; image_index < sc->image_count; ++image_index) {
+        if (sc->present_wait_sems[image_index] != VK_NULL_HANDLE) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int device_has_tracked_present_wait_semaphores(VkDevice device) {
+    if (device == VK_NULL_HANDLE) {
+        return 0;
+    }
+
+    for (int i = 0; i < g_swapchain_count; ++i) {
+        SwapchainData* sc = &g_swapchains[i];
+        if (sc->swapchain == VK_NULL_HANDLE || sc->device != device ||
+            !sc->present_wait_sems) {
+            continue;
+        }
+
+        for (uint32_t image_index = 0; image_index < sc->image_count; ++image_index) {
+            if (sc->present_wait_sems[image_index] != VK_NULL_HANDLE) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static void wait_for_swapchain_present_tracking(DeviceData* dev, SwapchainData* sc) {
+    if (!dev || !dev->device_wait_idle) {
+        return;
+    }
+
+    if (!swapchain_has_tracked_present_wait_semaphores(sc)) {
+        return;
+    }
+
+    (void)dev->device_wait_idle(dev->device);
+}
+
+static void wait_for_device_present_tracking(DeviceData* dev) {
+    if (!dev || !dev->device_wait_idle) {
+        return;
+    }
+
+    if (!device_has_tracked_present_wait_semaphores(dev->device)) {
+        return;
+    }
+
+    /* These semaphores stay alive until the present operation itself is done,
+     * which can outlive the overlay submit fence that created them. */
+    (void)dev->device_wait_idle(dev->device);
+}
+
+static void release_tracked_present_semaphore(DeviceData* dev,
+                                              VkDevice device,
+                                              VkSemaphore semaphore,
+                                              int discard) {
+    if (device_tracks_present_wait_semaphore(device, semaphore)) {
+        return;
+    }
+
+    if ((!dev || dev->device != device) && device != VK_NULL_HANDLE) {
+        dev = find_device(device);
+    }
+    if (!dev || !dev->overlay_ctx) {
+        return;
+    }
+
+    if (discard) {
+        sigaw_overlay_discard_present_semaphore(dev->overlay_ctx, semaphore);
+    } else {
+        sigaw_overlay_recycle_present_semaphore(dev->overlay_ctx, semaphore);
+    }
+}
+
+static void clear_swapchain_present_tracking(DeviceData* dev, SwapchainData* sc) {
+    if (!sc || !sc->present_wait_sems) {
+        return;
+    }
+
+    for (uint32_t image_index = 0; image_index < sc->image_count; ++image_index) {
+        discard_swapchain_present_semaphore(dev, sc, image_index);
+    }
+}
+
+static void clear_device_present_tracking(DeviceData* dev) {
+    if (!dev) {
+        return;
+    }
+
+    for (int i = 0; i < g_swapchain_count; ++i) {
+        if (g_swapchains[i].swapchain != VK_NULL_HANDLE &&
+            g_swapchains[i].device == dev->device) {
+            clear_swapchain_present_tracking(dev, &g_swapchains[i]);
+        }
+    }
+}
+
+static void recycle_swapchain_present_semaphore(DeviceData* dev,
+                                                SwapchainData* sc,
+                                                uint32_t image_index) {
+    if (!sc || !sc->present_wait_sems || image_index >= sc->image_count) {
+        return;
+    }
+
+    VkSemaphore semaphore = sc->present_wait_sems[image_index];
+    if (semaphore == VK_NULL_HANDLE) {
+        return;
+    }
+
+    sc->present_wait_sems[image_index] = VK_NULL_HANDLE;
+    release_tracked_present_semaphore(dev, sc->device, semaphore, 0);
+}
+
+static void discard_swapchain_present_semaphore(DeviceData* dev,
+                                                SwapchainData* sc,
+                                                uint32_t image_index) {
+    if (!sc || !sc->present_wait_sems || image_index >= sc->image_count) {
+        return;
+    }
+
+    VkSemaphore semaphore = sc->present_wait_sems[image_index];
+    if (semaphore == VK_NULL_HANDLE) {
+        return;
+    }
+
+    sc->present_wait_sems[image_index] = VK_NULL_HANDLE;
+    release_tracked_present_semaphore(dev, sc->device, semaphore, 1);
+}
+
+static void track_swapchain_present_semaphore(DeviceData* dev,
+                                              SwapchainData* sc,
+                                              uint32_t image_index,
+                                              VkSemaphore semaphore) {
+    if (!sc || !sc->present_wait_sems || image_index >= sc->image_count ||
+        semaphore == VK_NULL_HANDLE) {
+        return;
+    }
+
+    if (sc->present_wait_sems[image_index] == semaphore) {
+        return;
+    }
+
+    if (sc->present_wait_sems[image_index] != VK_NULL_HANDLE) {
+        recycle_swapchain_present_semaphore(dev, sc, image_index);
+    }
+
+    sc->present_wait_sems[image_index] = semaphore;
+}
+
+static PFN_vkAcquireNextImage2KHR resolve_acquire_next_image2(
+    PFN_vkGetDeviceProcAddr get_device_proc,
+    VkDevice device)
+{
+    if (!get_device_proc) {
+        return NULL;
+    }
+
+    PFN_vkAcquireNextImage2KHR acquire_next_image2 =
+        (PFN_vkAcquireNextImage2KHR)get_device_proc(device, "vkAcquireNextImage2");
+    if (!acquire_next_image2) {
+        acquire_next_image2 =
+            (PFN_vkAcquireNextImage2KHR)get_device_proc(device, "vkAcquireNextImage2KHR");
+    }
+
+    return acquire_next_image2;
+}
+
+static int present_result_keeps_wait_semaphore(VkResult result) {
+    return result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
+}
+
+static int present_call_keeps_wait_semaphore_for_swapchain(
+    const VkPresentInfoKHR* pPresentInfo,
+    VkResult aggregate_result,
+    uint32_t swapchain_index)
+{
+    if (!pPresentInfo || swapchain_index >= pPresentInfo->swapchainCount) {
+        return 0;
+    }
+
+    if (present_result_keeps_wait_semaphore(aggregate_result)) {
+        return 1;
+    }
+
+    if (pPresentInfo->pResults) {
+        return present_result_keeps_wait_semaphore(
+            pPresentInfo->pResults[swapchain_index]
+        );
+    }
+
+    /* Without per-swapchain results we can only distinguish the single
+     * swapchain case from ambiguous multi-swapchain failure. */
+    return pPresentInfo->swapchainCount > 1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -403,6 +657,7 @@ sigaw_CreateDevice(VkPhysicalDevice physicalDevice,
             (PFN_vkDeviceWaitIdle)get_device_proc(*pDevice, "vkDeviceWaitIdle");
         data->acquire_next_image =
             (PFN_vkAcquireNextImageKHR)get_device_proc(*pDevice, "vkAcquireNextImageKHR");
+        data->acquire_next_image2 = resolve_acquire_next_image2(get_device_proc, *pDevice);
 
         /* Get the graphics queue */
         PFN_vkGetDeviceQueue get_queue =
@@ -454,6 +709,8 @@ sigaw_DestroyDevice(VkDevice device,
 {
     DeviceData* data = find_device(device);
     if (data) {
+        wait_for_device_present_tracking(data);
+        clear_device_present_tracking(data);
         sigaw_release_swapchains_for_device(g_swapchains, &g_swapchain_count, device);
         if (data->overlay_ctx) {
             sigaw_overlay_destroy(data->overlay_ctx);
@@ -499,6 +756,7 @@ sigaw_CreateSwapchainKHR(VkDevice device,
         dev->get_swapchain_images(device, *pSwapchain, &sc->image_count, NULL);
         sc->images = (VkImage*)calloc(sc->image_count, sizeof(VkImage));
         dev->get_swapchain_images(device, *pSwapchain, &sc->image_count, sc->images);
+        sc->present_wait_sems = (VkSemaphore*)calloc(sc->image_count, sizeof(VkSemaphore));
 
         /* Keep renderer dimensions in sync once the overlay is active. */
         if (dev->overlay_ctx) {
@@ -522,12 +780,77 @@ sigaw_DestroySwapchainKHR(VkDevice device,
         return;
     }
 
-    dev->destroy_swapchain(device, swapchain, pAllocator);
-
     SwapchainData* sc = find_swapchain(swapchain);
     if (sc) {
+        wait_for_swapchain_present_tracking(dev, sc);
+    }
+
+    dev->destroy_swapchain(device, swapchain, pAllocator);
+
+    if (sc) {
+        clear_swapchain_present_tracking(dev, sc);
         sigaw_release_swapchain(g_swapchains, &g_swapchain_count, sc);
     }
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+sigaw_AcquireNextImageKHR(VkDevice device,
+                          VkSwapchainKHR swapchain,
+                          uint64_t timeout,
+                          VkSemaphore semaphore,
+                          VkFence fence,
+                          uint32_t* pImageIndex)
+{
+    DeviceData* dev = find_device(device);
+    if (!dev || !dev->acquire_next_image) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    VkResult result =
+        dev->acquire_next_image(device, swapchain, timeout, semaphore, fence, pImageIndex);
+    if ((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) && pImageIndex != NULL) {
+        SwapchainData* sc = find_swapchain(swapchain);
+        if (sc) {
+            recycle_swapchain_present_semaphore(dev, sc, *pImageIndex);
+        }
+    }
+    return result;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+sigaw_acquire_next_image2_common(VkDevice device,
+                                 const VkAcquireNextImageInfoKHR* pAcquireInfo,
+                                 uint32_t* pImageIndex)
+{
+    DeviceData* dev = find_device(device);
+    if (!dev || !dev->acquire_next_image2 || !pAcquireInfo) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    VkResult result = dev->acquire_next_image2(device, pAcquireInfo, pImageIndex);
+    if ((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) && pImageIndex != NULL) {
+        SwapchainData* sc = find_swapchain(pAcquireInfo->swapchain);
+        if (sc) {
+            recycle_swapchain_present_semaphore(dev, sc, *pImageIndex);
+        }
+    }
+    return result;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+sigaw_AcquireNextImage2KHR(VkDevice device,
+                           const VkAcquireNextImageInfoKHR* pAcquireInfo,
+                           uint32_t* pImageIndex)
+{
+    return sigaw_acquire_next_image2_common(device, pAcquireInfo, pImageIndex);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+sigaw_AcquireNextImage2(VkDevice device,
+                        const VkAcquireNextImageInfoKHR* pAcquireInfo,
+                        uint32_t* pImageIndex)
+{
+    return sigaw_acquire_next_image2_common(device, pAcquireInfo, pImageIndex);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -548,6 +871,8 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
     DeviceData* dev = find_device_for_queue(queue, &queue_family);
     VkPresentInfoKHR present_info = *pPresentInfo;
     int overlay_rendered = 0;
+    VkSemaphore present_wait_semaphore = VK_NULL_HANDLE;
+    int present_wait_submitted = 0;
 
     if (!dev && pPresentInfo->swapchainCount > 0) {
         SwapchainData* sc = find_swapchain(pPresentInfo->pSwapchains[0]);
@@ -602,6 +927,8 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
             inst_data = find_instance(dev->instance);
         }
 
+        wait_for_device_present_tracking(dev);
+        clear_device_present_tracking(dev);
         sigaw_overlay_destroy(dev->overlay_ctx);
         dev->overlay_ctx = NULL;
         dev->overlay_queue_family = UINT32_MAX;
@@ -626,33 +953,123 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 
     if (dev && dev->overlay_ctx && queue_family != UINT32_MAX &&
         dev->overlay_queue_family == queue_family) {
+        /* The final overlay submit must signal a semaphore for the forwarded
+         * present call; waiting on a host fence alone is not enough for all
+         * Vulkan loader / Wine paths. */
+        uint32_t last_render_index = UINT32_MAX;
         for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
             SwapchainData* sc = find_swapchain(pPresentInfo->pSwapchains[i]);
-            if (sc && sc->images && overlay_supports_format(sc->format)) {
-                uint32_t img_idx = pPresentInfo->pImageIndices[i];
-                if (img_idx < sc->image_count) {
-                    const uint32_t wait_count = overlay_rendered ? 0u : pPresentInfo->waitSemaphoreCount;
-                    const VkSemaphore* wait_sems = overlay_rendered ? NULL : pPresentInfo->pWaitSemaphores;
-                    if (sigaw_overlay_render(
-                        dev->overlay_ctx, queue,
-                        sc->images[img_idx], sc->format,
-                        sc->width, sc->height,
-                        wait_count, wait_sems,
-                        VK_NULL_HANDLE, VK_NULL_HANDLE
-                    )) {
-                        overlay_rendered = 1;
+            if (!sc || !sc->images || !overlay_supports_format(sc->format)) {
+                continue;
+            }
+
+            const uint32_t img_idx = pPresentInfo->pImageIndices[i];
+            if (img_idx < sc->image_count) {
+                last_render_index = i;
+            }
+        }
+
+        int can_render_overlay = 1;
+        if (last_render_index != UINT32_MAX) {
+            present_wait_semaphore =
+                sigaw_overlay_acquire_present_semaphore(dev->overlay_ctx);
+            if (present_wait_semaphore == VK_NULL_HANDLE) {
+                can_render_overlay = 0;
+            }
+        }
+
+        if (can_render_overlay) {
+            for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
+                SwapchainData* sc = find_swapchain(pPresentInfo->pSwapchains[i]);
+                if (sc && sc->images && overlay_supports_format(sc->format)) {
+                    uint32_t img_idx = pPresentInfo->pImageIndices[i];
+                    if (img_idx < sc->image_count) {
+                        const uint32_t wait_count =
+                            overlay_rendered ? 0u : pPresentInfo->waitSemaphoreCount;
+                        const VkSemaphore* wait_sems =
+                            overlay_rendered ? NULL : pPresentInfo->pWaitSemaphores;
+                        const VkSemaphore signal_sem =
+                            (i == last_render_index) ? present_wait_semaphore : VK_NULL_HANDLE;
+                        if (sigaw_overlay_render(
+                            dev->overlay_ctx, queue,
+                            sc->images[img_idx], sc->format,
+                            sc->width, sc->height,
+                            wait_count, wait_sems,
+                            signal_sem, VK_NULL_HANDLE
+                        )) {
+                            overlay_rendered = 1;
+                            if (signal_sem != VK_NULL_HANDLE) {
+                                present_wait_submitted = 1;
+                            }
+                        } else if (signal_sem != VK_NULL_HANDLE) {
+                            sigaw_overlay_recycle_present_semaphore(
+                                dev->overlay_ctx,
+                                signal_sem
+                            );
+                            present_wait_semaphore = VK_NULL_HANDLE;
+                        }
                     }
                 }
             }
         }
     }
 
+    if (!present_wait_submitted && present_wait_semaphore != VK_NULL_HANDLE &&
+        dev && dev->overlay_ctx) {
+        sigaw_overlay_recycle_present_semaphore(dev->overlay_ctx, present_wait_semaphore);
+        present_wait_semaphore = VK_NULL_HANDLE;
+    }
+
     /* Chain to the real present */
     if (dev && dev->queue_present) {
         if (overlay_rendered) {
-            present_info.waitSemaphoreCount = 0;
-            present_info.pWaitSemaphores = NULL;
-            return dev->queue_present(queue, &present_info);
+            if (present_wait_semaphore != VK_NULL_HANDLE) {
+                present_info.waitSemaphoreCount = 1;
+                present_info.pWaitSemaphores = &present_wait_semaphore;
+            }
+            VkResult result = dev->queue_present(queue, &present_info);
+            if (present_wait_submitted && present_wait_semaphore != VK_NULL_HANDLE) {
+                int tracked_present = 0;
+                for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
+                    if (!present_call_keeps_wait_semaphore_for_swapchain(
+                            &present_info,
+                            result,
+                            i
+                        )) {
+                        continue;
+                    }
+
+                    SwapchainData* sc = find_swapchain(pPresentInfo->pSwapchains[i]);
+                    if (!sc) {
+                        continue;
+                    }
+
+                    const uint32_t image_index = pPresentInfo->pImageIndices[i];
+                    if (image_index < sc->image_count) {
+                        track_swapchain_present_semaphore(
+                            dev,
+                            sc,
+                            image_index,
+                            present_wait_semaphore
+                        );
+                        tracked_present = 1;
+                    }
+                }
+
+                if (!tracked_present) {
+                    /* The present consumed the semaphore as a wait target;
+                     * vkDestroySemaphore requires all referencing batches to
+                     * have completed, so drain the queue first. */
+                    if (dev->device_wait_idle) {
+                        dev->device_wait_idle(dev->device);
+                    }
+                    sigaw_overlay_discard_present_semaphore(
+                        dev->overlay_ctx,
+                        present_wait_semaphore
+                    );
+                }
+            }
+            return result;
         }
         return dev->queue_present(queue, pPresentInfo);
     }
@@ -688,15 +1105,39 @@ sigaw_GetInstanceProcAddr(VkInstance instance, const char* pName)
 SIGAW_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 sigaw_GetDeviceProcAddr(VkDevice device, const char* pName)
 {
-    /* Functions we intercept */
-    INTERCEPT(vkDestroyDevice, DestroyDevice);
-    INTERCEPT(vkCreateSwapchainKHR, CreateSwapchainKHR);
-    INTERCEPT(vkDestroySwapchainKHR, DestroySwapchainKHR);
-    INTERCEPT(vkQueuePresentKHR, QueuePresentKHR);
-    INTERCEPT(vkGetDeviceProcAddr, GetDeviceProcAddr);
+    DeviceData* data = find_device(device);
+    if (strcmp(pName, "vkDestroyDevice") == 0) {
+        return (PFN_vkVoidFunction)sigaw_DestroyDevice;
+    }
+    if (strcmp(pName, "vkCreateSwapchainKHR") == 0) {
+        return (PFN_vkVoidFunction)sigaw_CreateSwapchainKHR;
+    }
+    if (strcmp(pName, "vkDestroySwapchainKHR") == 0) {
+        return (PFN_vkVoidFunction)sigaw_DestroySwapchainKHR;
+    }
+    if (strcmp(pName, "vkAcquireNextImageKHR") == 0) {
+        return (PFN_vkVoidFunction)sigaw_AcquireNextImageKHR;
+    }
+    if (strcmp(pName, "vkAcquireNextImage2") == 0) {
+        if (data && data->get_proc && data->get_proc(device, pName)) {
+            return (PFN_vkVoidFunction)sigaw_AcquireNextImage2;
+        }
+        return NULL;
+    }
+    if (strcmp(pName, "vkAcquireNextImage2KHR") == 0) {
+        if (data && data->get_proc && data->get_proc(device, pName)) {
+            return (PFN_vkVoidFunction)sigaw_AcquireNextImage2KHR;
+        }
+        return NULL;
+    }
+    if (strcmp(pName, "vkQueuePresentKHR") == 0) {
+        return (PFN_vkVoidFunction)sigaw_QueuePresentKHR;
+    }
+    if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
+        return (PFN_vkVoidFunction)sigaw_GetDeviceProcAddr;
+    }
 
     /* Chain to next layer */
-    DeviceData* data = find_device(device);
     if (data && data->get_proc) {
         return data->get_proc(device, pName);
     }

@@ -39,6 +39,7 @@ extern "C" {
     X(PFN_vkCreatePipelineLayout, CreatePipelineLayout, "vkCreatePipelineLayout") \
     X(PFN_vkCreateRenderPass, CreateRenderPass, "vkCreateRenderPass") \
     X(PFN_vkCreateSampler, CreateSampler, "vkCreateSampler") \
+    X(PFN_vkCreateSemaphore, CreateSemaphore, "vkCreateSemaphore") \
     X(PFN_vkCreateShaderModule, CreateShaderModule, "vkCreateShaderModule") \
     X(PFN_vkDestroyBuffer, DestroyBuffer, "vkDestroyBuffer") \
     X(PFN_vkDestroyCommandPool, DestroyCommandPool, "vkDestroyCommandPool") \
@@ -52,6 +53,7 @@ extern "C" {
     X(PFN_vkDestroyPipelineLayout, DestroyPipelineLayout, "vkDestroyPipelineLayout") \
     X(PFN_vkDestroyRenderPass, DestroyRenderPass, "vkDestroyRenderPass") \
     X(PFN_vkDestroySampler, DestroySampler, "vkDestroySampler") \
+    X(PFN_vkDestroySemaphore, DestroySemaphore, "vkDestroySemaphore") \
     X(PFN_vkDestroyShaderModule, DestroyShaderModule, "vkDestroyShaderModule") \
     X(PFN_vkDeviceWaitIdle, DeviceWaitIdle, "vkDeviceWaitIdle") \
     X(PFN_vkEndCommandBuffer, EndCommandBuffer, "vkEndCommandBuffer") \

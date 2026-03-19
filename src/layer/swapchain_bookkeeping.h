@@ -12,6 +12,7 @@ typedef struct {
     uint32_t       height;
     VkImage*       images;
     uint32_t       image_count;
+    VkSemaphore*   present_wait_sems;
 } SigawSwapchainData;
 
 static inline SigawSwapchainData* sigaw_find_swapchain(SigawSwapchainData* swapchains,
@@ -33,6 +34,8 @@ static inline void sigaw_clear_swapchain_slot(SigawSwapchainData* sc) {
 
     free(sc->images);
     sc->images = NULL;
+    free(sc->present_wait_sems);
+    sc->present_wait_sems = NULL;
     sc->image_count = 0;
     sc->swapchain = VK_NULL_HANDLE;
     sc->device = VK_NULL_HANDLE;

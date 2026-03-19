@@ -39,6 +39,9 @@ SigawOverlayContext* sigaw_overlay_create(VkDevice, VkPhysicalDevice, VkInstance
                                           VkFormat, uint32_t, uint32_t);
 void sigaw_overlay_destroy(SigawOverlayContext*);
 void sigaw_overlay_resize(SigawOverlayContext*, VkFormat, uint32_t, uint32_t);
+VkSemaphore sigaw_overlay_acquire_present_semaphore(SigawOverlayContext*);
+void sigaw_overlay_recycle_present_semaphore(SigawOverlayContext*, VkSemaphore);
+void sigaw_overlay_discard_present_semaphore(SigawOverlayContext*, VkSemaphore);
 int sigaw_overlay_render(SigawOverlayContext*, VkQueue, VkImage, VkFormat,
                          uint32_t, uint32_t, uint32_t, const VkSemaphore*,
                          VkSemaphore, VkFence);
@@ -99,6 +102,7 @@ static inline const SigawVulkanDispatch& sigaw_current_vk_dispatch() {
 #define vkCreatePipelineLayout sigaw_current_vk_dispatch().CreatePipelineLayout
 #define vkCreateRenderPass sigaw_current_vk_dispatch().CreateRenderPass
 #define vkCreateSampler sigaw_current_vk_dispatch().CreateSampler
+#define vkCreateSemaphore sigaw_current_vk_dispatch().CreateSemaphore
 #define vkCreateShaderModule sigaw_current_vk_dispatch().CreateShaderModule
 #define vkDestroyBuffer sigaw_current_vk_dispatch().DestroyBuffer
 #define vkDestroyCommandPool sigaw_current_vk_dispatch().DestroyCommandPool
@@ -112,6 +116,7 @@ static inline const SigawVulkanDispatch& sigaw_current_vk_dispatch() {
 #define vkDestroyPipelineLayout sigaw_current_vk_dispatch().DestroyPipelineLayout
 #define vkDestroyRenderPass sigaw_current_vk_dispatch().DestroyRenderPass
 #define vkDestroySampler sigaw_current_vk_dispatch().DestroySampler
+#define vkDestroySemaphore sigaw_current_vk_dispatch().DestroySemaphore
 #define vkDestroyShaderModule sigaw_current_vk_dispatch().DestroyShaderModule
 #define vkDeviceWaitIdle sigaw_current_vk_dispatch().DeviceWaitIdle
 #define vkEndCommandBuffer sigaw_current_vk_dispatch().EndCommandBuffer
@@ -950,6 +955,8 @@ struct Ctx {
     VkCommandPool    pool = VK_NULL_HANDLE;
     VkCommandBuffer  cmd  = VK_NULL_HANDLE;
     VkFence          fen  = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> present_sems;
+    std::vector<VkSemaphore> available_present_sems;
     VkBuffer         sbuf = VK_NULL_HANDLE;
     VkDeviceMemory   smem = VK_NULL_HANDLE;
     void*            sptr = nullptr;
@@ -2388,6 +2395,29 @@ static int render_overlay_copy(Ctx& c, VkQueue queue, VkImage target_image, VkFo
 /*  C API                                                                    */
 /* ======================================================================== */
 
+static VkSemaphore create_present_semaphore(Ctx& ctx)
+{
+    VkSemaphoreCreateInfo semaphore_info = {};
+    semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    if (vkCreateSemaphore(ctx.dev, &semaphore_info, nullptr, &semaphore) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+
+    ctx.present_sems.push_back(semaphore);
+    return semaphore;
+}
+
+static void erase_present_semaphore(std::vector<VkSemaphore>& semaphores,
+                                    VkSemaphore semaphore)
+{
+    semaphores.erase(
+        std::remove(semaphores.begin(), semaphores.end(), semaphore),
+        semaphores.end()
+    );
+}
+
 static void destroy_overlay_context(Ctx* ctx, bool wait_idle)
 {
     if (!ctx) {
@@ -2441,6 +2471,13 @@ static void destroy_overlay_context(Ctx* ctx, bool wait_idle)
         vkDestroyFence(ctx->dev, ctx->fen, nullptr);
         ctx->fen = VK_NULL_HANDLE;
     }
+    for (VkSemaphore semaphore : ctx->present_sems) {
+        if (semaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(ctx->dev, semaphore, nullptr);
+        }
+    }
+    ctx->available_present_sems.clear();
+    ctx->present_sems.clear();
     if (ctx->pool != VK_NULL_HANDLE) {
         vkDestroyCommandPool(ctx->dev, ctx->pool, nullptr);
         ctx->pool = VK_NULL_HANDLE;
@@ -2543,6 +2580,67 @@ void sigaw_overlay_resize(SigawOverlayContext* handle, VkFormat format,
     }
     ctx->sw = width;
     ctx->sh = height;
+}
+
+VkSemaphore sigaw_overlay_acquire_present_semaphore(SigawOverlayContext* handle) {
+    auto* ctx = reinterpret_cast<Ctx*>(handle);
+    if (!ctx || !ctx->ok) {
+        return VK_NULL_HANDLE;
+    }
+
+    ScopedDispatch scoped(&ctx->dispatch);
+    if (ctx->available_present_sems.empty()) {
+        const VkSemaphore semaphore = create_present_semaphore(*ctx);
+        if (semaphore == VK_NULL_HANDLE) {
+            return VK_NULL_HANDLE;
+        }
+        return semaphore;
+    }
+
+    const VkSemaphore semaphore = ctx->available_present_sems.back();
+    ctx->available_present_sems.pop_back();
+    return semaphore;
+}
+
+void sigaw_overlay_recycle_present_semaphore(SigawOverlayContext* handle,
+                                             VkSemaphore semaphore) {
+    auto* ctx = reinterpret_cast<Ctx*>(handle);
+    if (!ctx || !ctx->ok || semaphore == VK_NULL_HANDLE) {
+        return;
+    }
+
+    if (std::find(ctx->present_sems.begin(), ctx->present_sems.end(), semaphore) ==
+        ctx->present_sems.end()) {
+        return;
+    }
+    if (std::find(ctx->available_present_sems.begin(),
+                  ctx->available_present_sems.end(),
+                  semaphore) != ctx->available_present_sems.end()) {
+        return;
+    }
+
+    ctx->available_present_sems.push_back(semaphore);
+}
+
+void sigaw_overlay_discard_present_semaphore(SigawOverlayContext* handle,
+                                             VkSemaphore semaphore) {
+    auto* ctx = reinterpret_cast<Ctx*>(handle);
+    if (!ctx || !ctx->ok || semaphore == VK_NULL_HANDLE) {
+        return;
+    }
+
+    if (std::find(ctx->present_sems.begin(), ctx->present_sems.end(), semaphore) ==
+        ctx->present_sems.end()) {
+        return;
+    }
+
+    ScopedDispatch scoped(&ctx->dispatch);
+    if (ctx->fen != VK_NULL_HANDLE) {
+        vkWaitForFences(ctx->dev, 1, &ctx->fen, VK_TRUE, UINT64_MAX);
+    }
+    erase_present_semaphore(ctx->available_present_sems, semaphore);
+    erase_present_semaphore(ctx->present_sems, semaphore);
+    vkDestroySemaphore(ctx->dev, semaphore, nullptr);
 }
 
 int sigaw_overlay_render(SigawOverlayContext* handle, VkQueue queue,

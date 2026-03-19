@@ -490,6 +490,18 @@ test(
   layer_runtime_test,
 )
 
+layer_present_test = executable(
+  'sigaw-layer-present-test',
+  'tests/layer_present_test.c',
+  include_directories: include_directories('src'),
+  dependencies: [vulkan_dep],
+)
+
+test(
+  'sigaw-layer-present',
+  layer_present_test,
+)
+
 overlay_runtime_prepare_test = executable(
   'sigaw-overlay-runtime-prepare-test',
   [
