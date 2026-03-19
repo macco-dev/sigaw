@@ -464,6 +464,7 @@ static RGBA mix_rgba(RGBA a, RGBA b, float t) {
 
 static std::vector<uint32_t> utf8_codepoints(std::string_view text) {
     std::vector<uint32_t> out;
+    out.reserve(text.size());
     for (size_t i = 0; i < text.size(); ) {
         const uint8_t ch = static_cast<uint8_t>(text[i]);
         if (ch < 0x80) {
@@ -768,7 +769,7 @@ public:
         }
 
         auto cps = utf8_codepoints(text);
-        const auto ellipsis = utf8_codepoints("...");
+        static const auto ellipsis = utf8_codepoints("...");
         const int ellipsis_w = measure_codepoints(role, px, ellipsis);
 
         int draw_count = static_cast<int>(cps.size());
@@ -2195,15 +2196,15 @@ struct Runtime::Impl {
             return out;
         }
 
+        static_assert(sizeof(RGBA) == 4, "RGBA must be tightly packed");
         rgba.resize(static_cast<size_t>(crop_w) * crop_h * 4u);
-        for (uint32_t y = 0; y < crop_h; ++y) {
-            for (uint32_t x = 0; x < crop_w; ++x) {
-                const auto& src = panel.p[static_cast<size_t>(y) * panel.w + x];
-                const size_t idx = (static_cast<size_t>(y) * crop_w + x) * 4u;
-                rgba[idx + 0] = src.r;
-                rgba[idx + 1] = src.g;
-                rgba[idx + 2] = src.b;
-                rgba[idx + 3] = src.a;
+        if (crop_w == panel.w) {
+            std::memcpy(rgba.data(), panel.p.data(), rgba.size());
+        } else {
+            for (uint32_t y = 0; y < crop_h; ++y) {
+                std::memcpy(&rgba[static_cast<size_t>(y) * crop_w * 4u],
+                            &panel.p[static_cast<size_t>(y) * panel.w],
+                            static_cast<size_t>(crop_w) * 4u);
             }
         }
 
@@ -2219,12 +2220,14 @@ struct Runtime::Impl {
             cached_rgba.empty() ||
             std::memcmp(cached_rgba.data(), rgba.data(), rgba.size()) != 0;
         if (pixels_changed) {
-            cached_rgba = rgba;
+            std::swap(cached_rgba, rgba);
+            out.rgba = cached_rgba.data();
             cached_width = crop_w;
             cached_height = crop_h;
             out.sequence = ++frame_sequence;
             out.changed = true;
         } else {
+            out.rgba = cached_rgba.data();
             out.sequence = frame_sequence;
             out.changed = false;
         }
