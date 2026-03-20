@@ -468,19 +468,25 @@ int main(int argc, char** argv) {
         const sigaw::VoiceState no_voice;
         update_tray(&tray, config, false, no_voice);
 
+        bool waiting_for_discord = false;
+
         /* Main reconnection loop */
         while (g_running) {
-            fprintf(stderr, "[sigaw] Connecting to Discord...\n");
-
             sigaw::DiscordIpc ipc(config.client_id);
 
             if (!ipc.connect()) {
-                fprintf(stderr, "[sigaw] Discord not found, retrying in 5s...\n");
+                if (!waiting_for_discord) {
+                    fprintf(stderr,
+                            "[sigaw] Discord IPC socket not found; retrying every 5s until Discord starts\n");
+                    waiting_for_discord = true;
+                }
                 wait_with_control(
                     ctl, config, &profile_chat_requested, &config_watcher, 5000, &tray
                 );
                 continue;
             }
+
+            waiting_for_discord = false;
 
             if (!ipc.handshake()) {
                 fprintf(stderr, "[sigaw] Handshake failed, retrying in 5s...\n");

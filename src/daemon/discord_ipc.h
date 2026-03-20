@@ -177,7 +177,6 @@ public:
             if (try_sock(fp + "/discord-ipc-" + s)) return true;
             if (try_sock("/tmp/discord-ipc-" + s))  return true;
         }
-        fprintf(stderr, "[sigaw] Could not find Discord IPC socket\n");
         return false;
     }
 
