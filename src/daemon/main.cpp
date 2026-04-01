@@ -27,6 +27,7 @@
 #include "../common/protocol.h"
 
 static volatile sig_atomic_t g_running = 1;
+static constexpr int kDiscordAuthorizeTimeoutMs = 60000;
 
 static void signal_handler(int) {
     g_running = 0;
@@ -35,13 +36,23 @@ static void signal_handler(int) {
 struct TrayLoopResult {
     bool state_changed = false;
     bool reconnect_requested = false;
+    bool reauthenticate_requested = false;
     bool quit_requested = false;
 };
 
 static void update_tray(sigaw::tray::Icon* tray,
                         const sigaw::Config& config,
-                        bool discord_connected,
+                        sigaw::tray::DiscordConnectionState discord_state,
                         const sigaw::VoiceState& voice);
+static bool pump_pre_auth_controls(sigaw::ControlServer& ctl,
+                                   sigaw::Config& config,
+                                   bool* profile_chat_requested,
+                                   sigaw::ConfigWatcher* config_watcher,
+                                   sigaw::tray::Icon* tray = nullptr,
+                                   bool* reconnect_requested = nullptr,
+                                   bool* reauthenticate_requested = nullptr,
+                                   sigaw::tray::DiscordConnectionState discord_state =
+                                       sigaw::tray::DiscordConnectionState::Disconnected);
 static TrayLoopResult process_tray_actions(sigaw::tray::Icon* tray,
                                            sigaw::Config& config,
                                            bool profile_chat_requested,
@@ -73,64 +84,24 @@ static bool wait_with_control(sigaw::ControlServer& ctl, sigaw::Config& config,
                               sigaw::ConfigWatcher* config_watcher,
                               int total_ms,
                               sigaw::tray::Icon* tray = nullptr,
-                              bool* reconnect_requested = nullptr)
+                              bool* reconnect_requested = nullptr,
+                              bool* reauthenticate_requested = nullptr,
+                              sigaw::tray::DiscordConnectionState discord_state =
+                                  sigaw::tray::DiscordConnectionState::Disconnected)
 {
-    const sigaw::VoiceState no_voice;
-    for (int elapsed = 0; elapsed < total_ms && g_running; elapsed += 100) {
-        const auto tray_result = process_tray_actions(
-            tray,
-            config,
-            profile_chat_requested ? *profile_chat_requested : false,
-            false
-        );
-        if (tray_result.quit_requested) {
-            g_running = 0;
-            return false;
-        }
-        if (tray_result.reconnect_requested) {
-            if (reconnect_requested) {
-                *reconnect_requested = true;
-            }
-            return false;
-        }
-
-        if (config_watcher && config_watcher->consume_change()) {
-            const auto updated = sigaw::Config::load();
-            const bool updated_profile_chat_requested =
-                sigaw::Config::any_profile_requests_chat();
-            const bool reconnect = daemon_requires_reconnect(
+    for (int elapsed = 0; g_running && (total_ms < 0 || elapsed < total_ms); elapsed += 100) {
+        if (!pump_pre_auth_controls(
+                ctl,
                 config,
-                updated,
-                daemon_chat_requested(config, profile_chat_requested ? *profile_chat_requested : false),
-                daemon_chat_requested(updated, updated_profile_chat_requested)
-            );
-            config = updated;
-            if (profile_chat_requested) {
-                *profile_chat_requested = updated_profile_chat_requested;
-            }
-            if (reconnect) {
-                if (reconnect_requested) {
-                    *reconnect_requested = true;
-                }
-                return false;
-            }
-        }
-
-        const auto action = ctl.process_pending(config);
-        if (action == sigaw::ControlServer::Action::Quit) {
-            g_running = 0;
+                profile_chat_requested,
+                config_watcher,
+                tray,
+                reconnect_requested,
+                reauthenticate_requested,
+                discord_state
+            )) {
             return false;
         }
-        if (action == sigaw::ControlServer::Action::Reload) {
-            if (profile_chat_requested) {
-                *profile_chat_requested = sigaw::Config::any_profile_requests_chat();
-            }
-            if (reconnect_requested) {
-                *reconnect_requested = true;
-            }
-            return false;
-        }
-        update_tray(tray, config, false, no_voice);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return g_running != 0;
@@ -297,7 +268,7 @@ static bool open_config_in_editor(const sigaw::Config& config) {
 
 static void update_tray(sigaw::tray::Icon* tray,
                         const sigaw::Config& config,
-                        bool discord_connected,
+                        sigaw::tray::DiscordConnectionState discord_state,
                         const sigaw::VoiceState& voice)
 {
     if (!tray || !tray->available()) {
@@ -305,7 +276,7 @@ static void update_tray(sigaw::tray::Icon* tray,
     }
 
     sigaw::tray::StatusSnapshot snapshot;
-    snapshot.discord_connected = discord_connected;
+    snapshot.discord_state = discord_state;
     if (!voice.channel_id.empty()) {
         snapshot.channel_name = voice.channel_name;
         snapshot.user_count = voice.users.size();
@@ -314,6 +285,78 @@ static void update_tray(sigaw::tray::Icon* tray,
     snapshot.show_voice_messages = config.show_voice_channel_chat;
     snapshot.compact_mode = config.compact;
     tray->update(snapshot);
+}
+
+static bool pump_pre_auth_controls(sigaw::ControlServer& ctl,
+                                   sigaw::Config& config,
+                                   bool* profile_chat_requested,
+                                   sigaw::ConfigWatcher* config_watcher,
+                                   sigaw::tray::Icon* tray,
+                                   bool* reconnect_requested,
+                                   bool* reauthenticate_requested,
+                                   sigaw::tray::DiscordConnectionState discord_state)
+{
+    const auto tray_result = process_tray_actions(
+        tray,
+        config,
+        profile_chat_requested ? *profile_chat_requested : false,
+        false
+    );
+    if (tray_result.quit_requested) {
+        g_running = 0;
+        return false;
+    }
+    if (tray_result.reconnect_requested) {
+        if (reconnect_requested) {
+            *reconnect_requested = true;
+        }
+        if (tray_result.reauthenticate_requested && reauthenticate_requested) {
+            *reauthenticate_requested = true;
+        }
+        return false;
+    }
+
+    if (config_watcher && config_watcher->consume_change()) {
+        const auto current = config;
+        const auto updated = sigaw::Config::load();
+        const bool updated_profile_chat_requested =
+            sigaw::Config::any_profile_requests_chat();
+        const bool reconnect = daemon_requires_reconnect(
+            current,
+            updated,
+            daemon_chat_requested(current, profile_chat_requested ? *profile_chat_requested : false),
+            daemon_chat_requested(updated, updated_profile_chat_requested)
+        );
+        config = updated;
+        if (profile_chat_requested) {
+            *profile_chat_requested = updated_profile_chat_requested;
+        }
+        if (reconnect && reconnect_requested) {
+            *reconnect_requested = true;
+        }
+        if (reconnect) {
+            return false;
+        }
+    }
+
+    const auto action = ctl.process_pending(config);
+    if (action == sigaw::ControlServer::Action::Quit) {
+        g_running = 0;
+        return false;
+    }
+    if (action == sigaw::ControlServer::Action::Reload) {
+        if (profile_chat_requested) {
+            *profile_chat_requested = sigaw::Config::any_profile_requests_chat();
+        }
+        if (reconnect_requested) {
+            *reconnect_requested = true;
+        }
+        return false;
+    }
+
+    const sigaw::VoiceState no_voice;
+    update_tray(tray, config, discord_state, no_voice);
+    return g_running != 0;
 }
 
 static TrayLoopResult process_tray_actions(sigaw::tray::Icon* tray,
@@ -363,6 +406,9 @@ static TrayLoopResult process_tray_actions(sigaw::tray::Icon* tray,
                 daemon_chat_requested(config, profile_chat_requested)
             );
             result.state_changed = result.state_changed || chat_changed;
+        }
+        if (planned.reauthenticate_requested) {
+            result.reauthenticate_requested = true;
         }
         if (planned.reload_requested || planned.reconnect_requested) {
             result.reconnect_requested = true;
@@ -466,7 +512,12 @@ int main(int argc, char** argv) {
         (void)tray.open();
 
         const sigaw::VoiceState no_voice;
-        update_tray(&tray, config, false, no_voice);
+        update_tray(
+            &tray,
+            config,
+            sigaw::tray::DiscordConnectionState::Disconnected,
+            no_voice
+        );
 
         bool waiting_for_discord = false;
 
@@ -480,9 +531,21 @@ int main(int argc, char** argv) {
                             "[sigaw] Discord IPC socket not found; retrying every 5s until Discord starts\n");
                     waiting_for_discord = true;
                 }
+                bool force_reauthenticate = false;
                 wait_with_control(
-                    ctl, config, &profile_chat_requested, &config_watcher, 5000, &tray
+                    ctl,
+                    config,
+                    &profile_chat_requested,
+                    &config_watcher,
+                    5000,
+                    &tray,
+                    nullptr,
+                    &force_reauthenticate,
+                    sigaw::tray::DiscordConnectionState::Disconnected
                 );
+                if (force_reauthenticate) {
+                    sigaw::DiscordIpc::clear_saved_token_cache();
+                }
                 continue;
             }
 
@@ -490,26 +553,96 @@ int main(int argc, char** argv) {
 
             if (!ipc.handshake()) {
                 fprintf(stderr, "[sigaw] Handshake failed, retrying in 5s...\n");
+                bool force_reauthenticate = false;
                 wait_with_control(
-                    ctl, config, &profile_chat_requested, &config_watcher, 5000, &tray
+                    ctl,
+                    config,
+                    &profile_chat_requested,
+                    &config_watcher,
+                    5000,
+                    &tray,
+                    nullptr,
+                    &force_reauthenticate,
+                    sigaw::tray::DiscordConnectionState::Disconnected
                 );
+                if (force_reauthenticate) {
+                    sigaw::DiscordIpc::clear_saved_token_cache();
+                }
                 continue;
             }
 
             /* Authenticate */
+            bool auth_reconnect_requested = false;
+            bool auth_reauthenticate_requested = false;
             const bool want_daemon_chat = daemon_chat_requested(config, profile_chat_requested);
-            bool authorized = ipc.authorize(config.client_secret, want_daemon_chat);
-            if (!authorized && want_daemon_chat) {
-                fprintf(stderr,
-                        "[sigaw] Chat authorization failed; continuing with voice-only overlay\n");
-                authorized = ipc.authorize(config.client_secret, false);
+            update_tray(
+                &tray,
+                config,
+                sigaw::tray::DiscordConnectionState::AuthorizationPending,
+                no_voice
+            );
+            const auto auth_result = ipc.authorize(
+                config.client_secret,
+                want_daemon_chat,
+                kDiscordAuthorizeTimeoutMs,
+                [&]() {
+                    return pump_pre_auth_controls(
+                        ctl,
+                        config,
+                        &profile_chat_requested,
+                        &config_watcher,
+                        &tray,
+                        &auth_reconnect_requested,
+                        &auth_reauthenticate_requested,
+                        sigaw::tray::DiscordConnectionState::AuthorizationPending
+                    );
+                }
+            );
+            if (!g_running) {
+                break;
             }
-            if (!authorized) {
-                fprintf(stderr, "[sigaw] Auth failed (check client_id/secret)\n");
-                fprintf(stderr, "[sigaw] Retrying in 10s...\n");
-                wait_with_control(
-                    ctl, config, &profile_chat_requested, &config_watcher, 10000, &tray
+            if (auth_reconnect_requested ||
+                auth_result == sigaw::DiscordIpc::AuthorizeResult::Aborted) {
+                if (auth_reauthenticate_requested) {
+                    sigaw::DiscordIpc::clear_saved_token_cache();
+                }
+                continue;
+            }
+            if (auth_result == sigaw::DiscordIpc::AuthorizeResult::TimedOut) {
+                fprintf(stderr,
+                        "[sigaw] Discord authorization timed out; use the tray menu to reauthenticate\n");
+            } else if (auth_result == sigaw::DiscordIpc::AuthorizeResult::Failed) {
+                fprintf(stderr,
+                        "[sigaw] Auth failed; use the tray menu to reauthenticate\n");
+            }
+            if (auth_result == sigaw::DiscordIpc::AuthorizeResult::TimedOut ||
+                auth_result == sigaw::DiscordIpc::AuthorizeResult::Failed) {
+                ipc.disconnect();
+                bool reconnect_requested = false;
+                bool reauthenticate_requested = false;
+                update_tray(
+                    &tray,
+                    config,
+                    sigaw::tray::DiscordConnectionState::AuthorizationRequired,
+                    no_voice
                 );
+                wait_with_control(
+                    ctl,
+                    config,
+                    &profile_chat_requested,
+                    &config_watcher,
+                    -1,
+                    &tray,
+                    &reconnect_requested,
+                    &reauthenticate_requested,
+                    sigaw::tray::DiscordConnectionState::AuthorizationRequired
+                );
+                if (!g_running) {
+                    break;
+                }
+                if (reauthenticate_requested) {
+                    sigaw::DiscordIpc::clear_saved_token_cache();
+                }
                 continue;
             }
 
@@ -543,12 +676,18 @@ int main(int argc, char** argv) {
                 runtime, ipc, daemon_chat_requested(config, profile_chat_requested)
             );
             update_shm(shm, runtime.voice, avatar_cache);
-            update_tray(&tray, config, true, runtime.voice);
+            update_tray(
+                &tray,
+                config,
+                sigaw::tray::DiscordConnectionState::Connected,
+                runtime.voice
+            );
 
             /* Event loop */
             fprintf(stderr, "[sigaw] Listening for voice events...\n");
 
             bool reconnect_requested = false;
+            bool force_reauthenticate = false;
             while (g_running && ipc.is_connected()) {
                 bool state_changed = false;
                 bool closed = false;
@@ -567,6 +706,7 @@ int main(int argc, char** argv) {
                 }
                 if (tray_result.reconnect_requested) {
                     reconnect_requested = true;
+                    force_reauthenticate = tray_result.reauthenticate_requested;
                     break;
                 }
                 state_changed = state_changed || tray_result.state_changed;
@@ -713,7 +853,12 @@ int main(int argc, char** argv) {
 
                 (void)avatar_cache.consume_dirty();
 
-                update_tray(&tray, config, true, runtime.voice);
+                update_tray(
+                    &tray,
+                    config,
+                    sigaw::tray::DiscordConnectionState::Connected,
+                    runtime.voice
+                );
             }
 
             fprintf(stderr, "[sigaw] Disconnected, reconnecting...\n");
@@ -721,16 +866,37 @@ int main(int argc, char** argv) {
             /* Clear voice state on disconnect */
             runtime = {};
             update_shm(shm, runtime.voice, avatar_cache);
-            update_tray(&tray, config, false, runtime.voice);
+            update_tray(
+                &tray,
+                config,
+                sigaw::tray::DiscordConnectionState::Disconnected,
+                runtime.voice
+            );
 
             if (!g_running) {
                 break;
             }
 
+            if (force_reauthenticate) {
+                sigaw::DiscordIpc::clear_saved_token_cache();
+            }
+
             if (!reconnect_requested) {
+                bool wait_force_reauthenticate = false;
                 wait_with_control(
-                    ctl, config, &profile_chat_requested, &config_watcher, 2000, &tray
+                    ctl,
+                    config,
+                    &profile_chat_requested,
+                    &config_watcher,
+                    2000,
+                    &tray,
+                    nullptr,
+                    &wait_force_reauthenticate,
+                    sigaw::tray::DiscordConnectionState::Disconnected
                 );
+                if (wait_force_reauthenticate) {
+                    sigaw::DiscordIpc::clear_saved_token_cache();
+                }
             }
         }
     }

@@ -344,6 +344,62 @@ static int test_single_overlay_submit_forwards_layer_semaphore(void) {
     return 1;
 }
 
+static int test_wine_auto_single_overlay_uses_wait_free_present(void) {
+    reset_state();
+
+    VkImage images[] = { fake_image(0x115) };
+    VkSemaphore app_wait = (VkSemaphore)0x204;
+    const VkSemaphore app_waits[] = { app_wait };
+    const VkSwapchainKHR swapchains[] = { fake_swapchain(0x315) };
+    const uint32_t image_indices[] = { 0 };
+    const VkQueue queue = fake_queue(0x412);
+    const VkDevice device = fake_device(0x511);
+
+    DeviceData* dev = add_device(device, queue, 27);
+    dev->under_wine = 1;
+    dev->wine_policy = SIGAW_WINE_POLICY_AUTO;
+    SwapchainData* sc =
+        add_swapchain(device, swapchains[0], VK_FORMAT_B8G8R8A8_UNORM, images, 1);
+    g_next_present_semaphore = (VkSemaphore)0x611;
+
+    const VkPresentInfoKHR present = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = app_waits,
+        .swapchainCount = 1,
+        .pSwapchains = swapchains,
+        .pImageIndices = image_indices,
+    };
+
+    if (sigaw_QueuePresentKHR(queue, &present) != VK_SUCCESS) {
+        fprintf(stderr, "Wine auto single present should succeed\n");
+        return 0;
+    }
+    if (g_render_capture_count != 1) {
+        fprintf(stderr, "Wine auto single present should submit exactly one overlay render\n");
+        return 0;
+    }
+    if (g_render_capture[0].wait_count != 1 ||
+        g_render_capture[0].signal_sem != VK_NULL_HANDLE) {
+        fprintf(stderr, "Wine auto single render should consume app waits without signaling a layer semaphore\n");
+        return 0;
+    }
+    if (g_present_capture.wait_count != 0) {
+        fprintf(stderr, "Wine auto single present should forward with no wait semaphores\n");
+        return 0;
+    }
+    if (g_recycled_present_sem_count != 0 ||
+        g_discarded_present_sem_count != 0) {
+        fprintf(stderr, "Wine auto single present should not recycle or discard layer semaphores\n");
+        return 0;
+    }
+    if (sc->present_wait_sems[0] != VK_NULL_HANDLE) {
+        fprintf(stderr, "Wine auto single present should not track a layer semaphore on the swapchain image\n");
+        return 0;
+    }
+    return 1;
+}
+
 static int test_acquire_next_image_recycles_present_semaphore(void) {
     reset_state();
 
@@ -518,6 +574,74 @@ static int test_acquire_next_image2_core_recycles_present_semaphore(void) {
     return 1;
 }
 
+static int test_wine_auto_multi_overlay_uses_wait_free_present(void) {
+    reset_state();
+
+    VkImage images_a[] = { fake_image(0x116) };
+    VkImage images_b[] = { fake_image(0x117) };
+    VkSemaphore app_wait = (VkSemaphore)0x205;
+    const VkSemaphore app_waits[] = { app_wait };
+    const VkSwapchainKHR swapchains[] = {
+        fake_swapchain(0x316),
+        fake_swapchain(0x317),
+    };
+    const uint32_t image_indices[] = { 0, 0 };
+    const VkQueue queue = fake_queue(0x413);
+    const VkDevice device = fake_device(0x512);
+
+    DeviceData* dev = add_device(device, queue, 28);
+    dev->under_wine = 1;
+    dev->wine_policy = SIGAW_WINE_POLICY_AUTO;
+    SwapchainData* sc_a =
+        add_swapchain(device, swapchains[0], VK_FORMAT_B8G8R8A8_UNORM, images_a, 1);
+    SwapchainData* sc_b =
+        add_swapchain(device, swapchains[1], VK_FORMAT_B8G8R8A8_UNORM, images_b, 1);
+    g_next_present_semaphore = (VkSemaphore)0x612;
+
+    const VkPresentInfoKHR present = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = app_waits,
+        .swapchainCount = 2,
+        .pSwapchains = swapchains,
+        .pImageIndices = image_indices,
+    };
+
+    if (sigaw_QueuePresentKHR(queue, &present) != VK_SUCCESS) {
+        fprintf(stderr, "Wine auto multi-present should succeed\n");
+        return 0;
+    }
+    if (g_render_capture_count != 2) {
+        fprintf(stderr, "Wine auto multi-present should submit two overlay renders\n");
+        return 0;
+    }
+    if (g_render_capture[0].wait_count != 1 ||
+        g_render_capture[0].signal_sem != VK_NULL_HANDLE) {
+        fprintf(stderr, "Wine auto multi-present should consume app waits on the first render without signaling a layer semaphore\n");
+        return 0;
+    }
+    if (g_render_capture[1].wait_count != 0 ||
+        g_render_capture[1].signal_sem != VK_NULL_HANDLE) {
+        fprintf(stderr, "Wine auto multi-present should submit later renders without waits or layer semaphores\n");
+        return 0;
+    }
+    if (g_present_capture.wait_count != 0) {
+        fprintf(stderr, "Wine auto multi-present should forward with no wait semaphores\n");
+        return 0;
+    }
+    if (g_recycled_present_sem_count != 0 ||
+        g_discarded_present_sem_count != 0) {
+        fprintf(stderr, "Wine auto multi-present should not recycle or discard layer semaphores\n");
+        return 0;
+    }
+    if (sc_a->present_wait_sems[0] != VK_NULL_HANDLE ||
+        sc_b->present_wait_sems[0] != VK_NULL_HANDLE) {
+        fprintf(stderr, "Wine auto multi-present should not track layer semaphores on swapchain images\n");
+        return 0;
+    }
+    return 1;
+}
+
 static int test_multi_swapchain_overlay_only_signals_last_submit(void) {
     reset_state();
 
@@ -568,6 +692,58 @@ static int test_multi_swapchain_overlay_only_signals_last_submit(void) {
     if (g_present_capture.wait_count != 1 ||
         g_present_capture.wait_sems[0] != g_next_present_semaphore) {
         fprintf(stderr, "forwarded present should wait on the final overlay semaphore\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int test_wine_force_preserves_layer_present_semaphore_path(void) {
+    reset_state();
+
+    VkImage images[] = { fake_image(0x118) };
+    VkSemaphore app_wait = (VkSemaphore)0x206;
+    const VkSemaphore app_waits[] = { app_wait };
+    const VkSwapchainKHR swapchains[] = { fake_swapchain(0x318) };
+    const uint32_t image_indices[] = { 0 };
+    const VkQueue queue = fake_queue(0x414);
+    const VkDevice device = fake_device(0x513);
+
+    DeviceData* dev = add_device(device, queue, 29);
+    dev->under_wine = 1;
+    dev->wine_policy = SIGAW_WINE_POLICY_FORCE;
+    SwapchainData* sc =
+        add_swapchain(device, swapchains[0], VK_FORMAT_B8G8R8A8_UNORM, images, 1);
+    g_next_present_semaphore = (VkSemaphore)0x613;
+
+    const VkPresentInfoKHR present = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = app_waits,
+        .swapchainCount = 1,
+        .pSwapchains = swapchains,
+        .pImageIndices = image_indices,
+    };
+
+    if (sigaw_QueuePresentKHR(queue, &present) != VK_SUCCESS) {
+        fprintf(stderr, "Wine force single present should succeed\n");
+        return 0;
+    }
+    if (g_render_capture_count != 1) {
+        fprintf(stderr, "Wine force single present should submit exactly one overlay render\n");
+        return 0;
+    }
+    if (g_render_capture[0].wait_count != 1 ||
+        g_render_capture[0].signal_sem != g_next_present_semaphore) {
+        fprintf(stderr, "Wine force should keep the layer semaphore signaling path\n");
+        return 0;
+    }
+    if (g_present_capture.wait_count != 1 ||
+        g_present_capture.wait_sems[0] != g_next_present_semaphore) {
+        fprintf(stderr, "Wine force should forward present waiting on the layer semaphore\n");
+        return 0;
+    }
+    if (sc->present_wait_sems[0] != g_next_present_semaphore) {
+        fprintf(stderr, "Wine force should continue tracking the layer semaphore on the presented image\n");
         return 0;
     }
     return 1;
@@ -650,6 +826,57 @@ static int test_multi_present_tracks_every_swapchain_image(void) {
     }
     if (sc_b->present_wait_sems[0] != VK_NULL_HANDLE) {
         fprintf(stderr, "final reacquire should clear the last tracked swapchain image slot\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int test_wine_disable_bypasses_overlay_and_preserves_present_waits(void) {
+    reset_state();
+
+    VkImage images[] = { fake_image(0x119) };
+    VkSemaphore app_wait = (VkSemaphore)0x207;
+    const VkSemaphore app_waits[] = { app_wait };
+    const VkSwapchainKHR swapchains[] = { fake_swapchain(0x319) };
+    const uint32_t image_indices[] = { 0 };
+    const VkQueue queue = fake_queue(0x415);
+    const VkDevice device = fake_device(0x514);
+
+    DeviceData* dev = add_device(device, queue, 30);
+    dev->under_wine = 1;
+    dev->wine_policy = SIGAW_WINE_POLICY_DISABLE;
+    dev->overlay_ctx = NULL;
+    SwapchainData* sc =
+        add_swapchain(device, swapchains[0], VK_FORMAT_B8G8R8A8_UNORM, images, 1);
+
+    const VkPresentInfoKHR present = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = app_waits,
+        .swapchainCount = 1,
+        .pSwapchains = swapchains,
+        .pImageIndices = image_indices,
+    };
+
+    if (sigaw_QueuePresentKHR(queue, &present) != VK_SUCCESS) {
+        fprintf(stderr, "Wine disable present should succeed\n");
+        return 0;
+    }
+    if (g_render_capture_count != 0) {
+        fprintf(stderr, "Wine disable should bypass overlay rendering\n");
+        return 0;
+    }
+    if (!dev->overlay_disabled) {
+        fprintf(stderr, "Wine disable should mark the overlay disabled for the process\n");
+        return 0;
+    }
+    if (g_present_capture.wait_count != 1 ||
+        g_present_capture.wait_sems[0] != app_wait) {
+        fprintf(stderr, "Wine disable should preserve the application's original present wait chain\n");
+        return 0;
+    }
+    if (sc->present_wait_sems[0] != VK_NULL_HANDLE) {
+        fprintf(stderr, "Wine disable should not track layer semaphores on the swapchain image\n");
         return 0;
     }
     return 1;
@@ -1116,6 +1343,9 @@ int main(void) {
     if (!test_single_overlay_submit_forwards_layer_semaphore()) {
         return 1;
     }
+    if (!test_wine_auto_single_overlay_uses_wait_free_present()) {
+        return 1;
+    }
     if (!test_acquire_next_image_recycles_present_semaphore()) {
         return 1;
     }
@@ -1125,10 +1355,19 @@ int main(void) {
     if (!test_acquire_next_image2_core_recycles_present_semaphore()) {
         return 1;
     }
+    if (!test_wine_auto_multi_overlay_uses_wait_free_present()) {
+        return 1;
+    }
     if (!test_multi_swapchain_overlay_only_signals_last_submit()) {
         return 1;
     }
+    if (!test_wine_force_preserves_layer_present_semaphore_path()) {
+        return 1;
+    }
     if (!test_multi_present_tracks_every_swapchain_image()) {
+        return 1;
+    }
+    if (!test_wine_disable_bypasses_overlay_and_preserves_present_waits()) {
         return 1;
     }
     if (!test_failed_present_signaller_preserves_original_waits()) {

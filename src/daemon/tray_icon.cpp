@@ -38,8 +38,18 @@ std::filesystem::path icon_theme_dir() {
     return installed_dir;
 }
 
-std::string connection_label(bool connected) {
-    return connected ? "Discord: connected" : "Discord: disconnected";
+std::string connection_label(DiscordConnectionState state) {
+    switch (state) {
+        case DiscordConnectionState::Connected:
+            return "Discord: connected";
+        case DiscordConnectionState::AuthorizationPending:
+            return "Discord: waiting for approval";
+        case DiscordConnectionState::AuthorizationRequired:
+            return "Discord: authorization required";
+        case DiscordConnectionState::Disconnected:
+        default:
+            return "Discord: disconnected";
+    }
 }
 
 std::string channel_label(const StatusSnapshot& snapshot) {
@@ -63,6 +73,7 @@ struct Icon::Impl {
     GtkCheckMenuItem*  overlay_item = nullptr;
     GtkCheckMenuItem*  voice_messages_item = nullptr;
     GtkCheckMenuItem*  compact_item = nullptr;
+    GtkWidget*         reauthenticate_item = nullptr;
     std::deque<Action> actions;
     std::string        icon_path;
     bool               syncing_menu = false;
@@ -116,7 +127,7 @@ struct Icon::Impl {
 
     void update(const StatusSnapshot& snapshot) {
         gtk_menu_item_set_label(GTK_MENU_ITEM(connection_item),
-                                connection_label(snapshot.discord_connected).c_str());
+                                connection_label(snapshot.discord_state).c_str());
         gtk_menu_item_set_label(GTK_MENU_ITEM(channel_item),
                                 channel_label(snapshot).c_str());
 
@@ -201,6 +212,11 @@ bool Icon::open() {
     gtk_menu_shell_append(GTK_MENU_SHELL(impl->menu), gtk_separator_menu_item_new());
     (void)impl->make_menu_item("Open config", "activate", Action::OpenConfig);
     (void)impl->make_menu_item("Reload config", "activate", Action::ReloadConfig);
+    impl->reauthenticate_item = impl->make_menu_item(
+        "Reauthenticate with Discord",
+        "activate",
+        Action::Reauthenticate
+    );
     (void)impl->make_menu_item("Stop daemon", "activate", Action::StopDaemon);
 
     gtk_widget_show_all(impl->menu);

@@ -2,6 +2,7 @@
 #define SIGAW_DISCORD_IPC_H
 
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <functional>
 #include <vector>
@@ -158,10 +159,22 @@ private:
 
 class DiscordIpc {
 public:
+    enum class AuthorizeResult {
+        Success,
+        MissingScope,
+        TimedOut,
+        Aborted,
+        Failed,
+    };
+
     explicit DiscordIpc(const std::string& client_id)
         : client_id_(client_id) {}
 
     ~DiscordIpc() { disconnect(); }
+
+    static void clear_saved_token_cache() {
+        clear_saved_token();
+    }
 
     /* Connect to Discord's local IPC socket (tries 0..9). */
     bool connect() {
@@ -213,19 +226,26 @@ public:
      * 1) Check for cached token -- if valid, use it directly.
      * 2) Otherwise: AUTHORIZE -> exchange code -> AUTHENTICATE.
      */
-    bool authorize(const std::string& secret, bool require_messages_read = false) {
+    AuthorizeResult authorize(const std::string& secret,
+                              bool require_messages_read = false,
+                              int authorize_timeout_ms = -1,
+                              const std::function<bool()>& pump_events = {})
+    {
         /* Try cached token first */
         std::string token = load_token();
         if (!token.empty()) {
-            if (authenticate(token) && scope_satisfied(require_messages_read)) {
-                return true;
+            if (authenticate(token)) {
+                if (scope_satisfied(require_messages_read)) {
+                    return AuthorizeResult::Success;
+                }
+
+                fprintf(stderr,
+                        "[sigaw] Cached token missing messages.read scope; continuing with voice-only overlay\n");
+                return AuthorizeResult::MissingScope;
             }
 
-            if (authed_ && !scope_satisfied(require_messages_read)) {
-                fprintf(stderr, "[sigaw] Cached token missing messages.read scope, re-authorizing\n");
-            } else {
-                fprintf(stderr, "[sigaw] Cached token expired, re-authorizing\n");
-            }
+            fprintf(stderr, "[sigaw] Cached token expired, re-authorizing\n");
+            clear_saved_token();
             clear_auth_state();
         }
 
@@ -234,23 +254,43 @@ public:
         if (require_messages_read) {
             scopes.push_back("messages.read");
         }
+        const std::string authorize_nonce = nonce();
         json req = {
             {"cmd", "AUTHORIZE"},
-            {"nonce", nonce()},
+            {"nonce", authorize_nonce},
             {"args", {
                 {"client_id", client_id_},
                 {"scopes", scopes},
             }}
         };
         json j;
-        /* This blocks until user clicks Authorize in Discord */
-        if (!send_request(req, j)) return false;
-        if (j.is_discarded() || !j.contains("data")) return false;
+        if (!send(Opcode::Frame, req.dump())) {
+            return AuthorizeResult::Failed;
+        }
+
+        const auto wait_status = wait_for_response(
+            authorize_nonce,
+            "AUTHORIZE",
+            j,
+            authorize_timeout_ms,
+            pump_events
+        );
+        if (wait_status == WaitStatus::TimedOut) {
+            fprintf(stderr, "[sigaw] Discord authorization timed out waiting for approval\n");
+            return AuthorizeResult::TimedOut;
+        }
+        if (wait_status == WaitStatus::Aborted) {
+            return AuthorizeResult::Aborted;
+        }
+        if (wait_status != WaitStatus::Matched || j.is_discarded() || !j.contains("data")) {
+            return AuthorizeResult::Failed;
+        }
+
         const std::string code = json_utils::string_or(j["data"], "code");
         if (code.empty()) {
             fprintf(stderr, "[sigaw] AUTHORIZE rejected: %s\n",
                     j.dump(2).c_str());
-            return false;
+            return AuthorizeResult::Failed;
         }
         fprintf(stderr, "[sigaw] Got auth code, exchanging for token...\n");
 
@@ -258,21 +298,22 @@ public:
         token = exchange_token(code, secret);
         if (token.empty()) {
             fprintf(stderr, "[sigaw] Token exchange failed\n");
-            return false;
+            return AuthorizeResult::Failed;
         }
 
         save_token(token);
         if (!authenticate(token)) {
-            return false;
+            clear_saved_token();
+            return AuthorizeResult::Failed;
         }
 
         if (!scope_satisfied(require_messages_read)) {
-            fprintf(stderr, "[sigaw] Authenticated token missing required scopes\n");
-            clear_auth_state();
-            return false;
+            fprintf(stderr,
+                    "[sigaw] Authenticated token missing messages.read scope; continuing with voice-only overlay\n");
+            return AuthorizeResult::MissingScope;
         }
 
-        return true;
+        return AuthorizeResult::Success;
     }
 
     /* Subscribe to VOICE_CHANNEL_SELECT (global). */
@@ -457,6 +498,13 @@ public:
     const DiscordUserIdentity& local_user() const { return inbox_.local_user(); }
 
 private:
+    enum class WaitStatus {
+        Matched,
+        TimedOut,
+        Aborted,
+        Closed,
+    };
+
     std::string client_id_;
     int fd_ = -1;
     bool connected_ = false, authed_ = false;
@@ -540,23 +588,62 @@ private:
         if (!send(Opcode::Frame, request.dump())) {
             return false;
         }
-        return wait_for_response(nonce_value, cmd_value, response);
+        return wait_for_response(nonce_value, cmd_value, response) == WaitStatus::Matched;
     }
 
-    bool wait_for_response(const std::string& nonce_value,
-                           const std::string& expected_cmd,
-                           json& response)
+    WaitStatus wait_for_response(const std::string& nonce_value,
+                                 const std::string& expected_cmd,
+                                 json& response,
+                                 int timeout_ms = -1,
+                                 const std::function<bool()>& pump_events = {})
     {
         if (inbox_.take_response(nonce_value, expected_cmd, response)) {
-            return true;
+            return WaitStatus::Matched;
         }
 
+        const auto deadline = timeout_ms >= 0
+            ? std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms)
+            : std::chrono::steady_clock::time_point::max();
+
         while (fd_ >= 0) {
+            if (pump_events && !pump_events()) {
+                return WaitStatus::Aborted;
+            }
+
+            int poll_timeout_ms = 100;
+            if (timeout_ms >= 0) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    return WaitStatus::TimedOut;
+                }
+                poll_timeout_ms = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count()
+                );
+                poll_timeout_ms = std::clamp(poll_timeout_ms, 0, 100);
+            }
+
+            struct pollfd pfd = {fd_, POLLIN, 0};
+            const int poll_result = ::poll(&pfd, 1, poll_timeout_ms);
+            if (poll_result < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                connected_ = false;
+                return WaitStatus::Closed;
+            }
+            if (poll_result == 0) {
+                continue;
+            }
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                connected_ = false;
+                return WaitStatus::Closed;
+            }
+
             Opcode op;
             std::string payload;
             if (!recv(op, payload)) {
                 connected_ = false;
-                return false;
+                return WaitStatus::Closed;
             }
 
             if (op == Opcode::Ping) {
@@ -565,7 +652,7 @@ private:
             }
             if (op == Opcode::Close) {
                 connected_ = false;
-                return false;
+                return WaitStatus::Closed;
             }
 
             auto j = json::parse(payload, nullptr, false);
@@ -574,11 +661,11 @@ private:
             }
 
             if (inbox_.store_or_match(j, nonce_value, expected_cmd, response)) {
-                return true;
+                return WaitStatus::Matched;
             }
         }
 
-        return false;
+        return WaitStatus::Closed;
     }
 
     bool sub(const std::string& evt, json args = json::object()) {
@@ -735,6 +822,11 @@ private:
         std::filesystem::permissions(p,
             std::filesystem::perms::owner_read |
             std::filesystem::perms::owner_write);
+    }
+
+    static void clear_saved_token() {
+        std::error_code ec;
+        std::filesystem::remove(token_path(), ec);
     }
 };
 

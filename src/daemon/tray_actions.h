@@ -13,6 +13,7 @@ enum class Action {
     ToggleCompactMode,
     OpenConfig,
     ReloadConfig,
+    Reauthenticate,
     StopDaemon,
 };
 
@@ -22,6 +23,7 @@ struct PlannedAction {
     bool clear_chat_state = false;
     bool refresh_chat_state = false;
     bool reconnect_requested = false;
+    bool reauthenticate_requested = false;
     bool reload_requested = false;
     bool open_config_requested = false;
     bool stop_daemon = false;

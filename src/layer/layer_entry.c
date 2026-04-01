@@ -268,6 +268,10 @@ static void handle_overlay_init_failure(DeviceData* dev, const char* message) {
     log_overlay_message(dev, message);
 }
 
+static int device_uses_wine_safe_present_path(const DeviceData* dev) {
+    return dev && dev->under_wine && dev->wine_policy == SIGAW_WINE_POLICY_AUTO;
+}
+
 static int overlay_supports_format(VkFormat format) {
     switch (format) {
         case VK_FORMAT_R8G8B8A8_UNORM:
@@ -871,6 +875,7 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
     DeviceData* dev = find_device_for_queue(queue, &queue_family);
     VkPresentInfoKHR present_info = *pPresentInfo;
     int overlay_rendered = 0;
+    int wine_safe_present_path = 0;
     VkSemaphore present_wait_semaphore = VK_NULL_HANDLE;
     int present_wait_submitted = 0;
 
@@ -880,6 +885,8 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
             dev = find_device(sc->device);
         }
     }
+
+    wine_safe_present_path = device_uses_wine_safe_present_path(dev);
 
     if (dev && !dev->overlay_ctx &&
         pPresentInfo->swapchainCount > 0) {
@@ -953,9 +960,9 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 
     if (dev && dev->overlay_ctx && queue_family != UINT32_MAX &&
         dev->overlay_queue_family == queue_family) {
-        /* The final overlay submit must signal a semaphore for the forwarded
-         * present call; waiting on a host fence alone is not enough for all
-         * Vulkan loader / Wine paths. */
+        /* Native and forced Wine paths forward present behind a layer-owned
+         * semaphore. Wine auto mode instead fence-waits inside the renderer
+         * and forwards the original present call without layer waits. */
         uint32_t last_render_index = UINT32_MAX;
         for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
             SwapchainData* sc = find_swapchain(pPresentInfo->pSwapchains[i]);
@@ -970,7 +977,7 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
         }
 
         int can_render_overlay = 1;
-        if (last_render_index != UINT32_MAX) {
+        if (!wine_safe_present_path && last_render_index != UINT32_MAX) {
             present_wait_semaphore =
                 sigaw_overlay_acquire_present_semaphore(dev->overlay_ctx);
             if (present_wait_semaphore == VK_NULL_HANDLE) {
@@ -989,7 +996,9 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
                         const VkSemaphore* wait_sems =
                             overlay_rendered ? NULL : pPresentInfo->pWaitSemaphores;
                         const VkSemaphore signal_sem =
-                            (i == last_render_index) ? present_wait_semaphore : VK_NULL_HANDLE;
+                            (!wine_safe_present_path && i == last_render_index)
+                                ? present_wait_semaphore
+                                : VK_NULL_HANDLE;
                         if (sigaw_overlay_render(
                             dev->overlay_ctx, queue,
                             sc->images[img_idx], sc->format,
@@ -1026,6 +1035,9 @@ sigaw_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
             if (present_wait_semaphore != VK_NULL_HANDLE) {
                 present_info.waitSemaphoreCount = 1;
                 present_info.pWaitSemaphores = &present_wait_semaphore;
+            } else if (wine_safe_present_path) {
+                present_info.waitSemaphoreCount = 0;
+                present_info.pWaitSemaphores = NULL;
             }
             VkResult result = dev->queue_present(queue, &present_info);
             if (present_wait_submitted && present_wait_semaphore != VK_NULL_HANDLE) {

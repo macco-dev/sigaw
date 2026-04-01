@@ -9,8 +9,15 @@
 
 namespace sigaw::tray {
 
+enum class DiscordConnectionState {
+    Disconnected,
+    Connected,
+    AuthorizationPending,
+    AuthorizationRequired,
+};
+
 struct StatusSnapshot {
-    bool        discord_connected = false;
+    DiscordConnectionState discord_state = DiscordConnectionState::Disconnected;
     std::string channel_name;
     std::size_t user_count = 0;
     bool        overlay_visible = true;

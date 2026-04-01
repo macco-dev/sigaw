@@ -161,6 +161,18 @@ bool test_reload_and_stop_actions_map_to_daemon_controls() {
         return false;
     }
 
+    const auto reauth = sigaw::tray::plan_action(
+        sigaw::tray::Action::Reauthenticate,
+        cfg,
+        false,
+        true
+    );
+    if (!reauth.reconnect_requested || !reauth.reauthenticate_requested ||
+        reauth.updated_config || reauth.reload_requested || reauth.stop_daemon) {
+        std::cerr << "reauth action should request reconnect without mutating config\n";
+        return false;
+    }
+
     const auto stop = sigaw::tray::plan_action(
         sigaw::tray::Action::StopDaemon,
         cfg,

@@ -60,6 +60,11 @@ PlannedAction plan_action(Action action,
             planned.reload_requested = true;
             break;
 
+        case Action::Reauthenticate:
+            planned.reconnect_requested = true;
+            planned.reauthenticate_requested = true;
+            break;
+
         case Action::StopDaemon:
             planned.stop_daemon = true;
             break;
