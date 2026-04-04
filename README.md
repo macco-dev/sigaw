@@ -101,6 +101,16 @@ systemctl --user daemon-reload
 systemctl --user enable --now sigaw-daemon
 ```
 
+The packaged user unit is bound to `graphical-session.target`, so it starts only
+after the desktop session is ready and can expose the tray icon.
+
+If you are upgrading from an older install that enabled `sigaw-daemon` under
+`default.target`, move the existing enablement with:
+
+```bash
+systemctl --user reenable --now sigaw-daemon
+```
+
 On first run, Discord should prompt for authorization.
 
 When started inside a graphical session with an AppIndicator/StatusNotifier
@@ -243,6 +253,7 @@ If the overlay does not appear:
 If the tray icon does not appear:
 
 - Confirm you started `sigaw-daemon` from a graphical user session.
+- If you upgraded from an older install, run `systemctl --user reenable --now sigaw-daemon` so the user unit is attached to `graphical-session.target`.
 - Make sure your desktop environment exposes an AppIndicator or StatusNotifier host.
 
 If you need daemon logs:

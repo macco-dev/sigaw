@@ -1,6 +1,7 @@
 [Unit]
 Description=Sigaw - Discord voice overlay daemon
 Documentation=https://git.macco.dev/macco/sigaw
+PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
@@ -17,4 +18,4 @@ ReadWritePaths=%h/.config/sigaw
 ReadWritePaths=%h/.cache/sigaw
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
